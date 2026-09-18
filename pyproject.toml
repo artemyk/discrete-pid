@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discrete-pid"
+version = "0.1.0"
+description = "Fast Blackwell redundancy for binary targets or binary sources"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+garblings = ["scipy>=1.10"]
+test = ["scipy>=1.10"]
+
+[project.urls]
+Repository = "https://github.com/artemyk/discrete-pid"
+
+[tool.setuptools.packages.find]
+include = ["discrete_pid*"]

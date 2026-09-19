@@ -47,6 +47,30 @@ def validate_joints(joints: Iterable[Array], atol: float) -> tuple[list[Array], 
     """Copy and normalize joint tables; never mutate caller-owned arrays."""
     if not np.isfinite(atol) or atol <= 0:
         raise ValueError("atol must be finite and positive")
+    joints = list(joints)
+    # A batch avoids thousands of small NumPy calls when alphabets agree.
+    # Keep the general path for ragged, object, and other array-like inputs.
+    if joints and all(isinstance(j, np.ndarray) and j.ndim == 2
+                      and j.shape == joints[0].shape and min(j.shape) > 0
+                      and j.dtype.kind in "fiu" for j in joints):
+        original = np.asarray(joints, dtype=float)
+        if not np.all(np.isfinite(original)) or np.any(original < 0):
+            raise ValueError("joint tables must be finite and nonnegative")
+        totals = original.sum(axis=(1, 2))
+        if np.any(~np.isfinite(totals)) or np.any(totals <= 0) or np.any(abs(totals - 1) > atol):
+            raise ValueError("joint tables must sum to one within atol")
+        tables = original / totals[:, None, None]
+        priors = tables.sum(axis=2)
+        common_prior = priors[0]
+        if np.any(abs(priors - common_prior) > atol):
+            raise ValueError("all joint tables must have the same target marginal")
+        if np.any((priors > 0) != (common_prior > 0)):
+            raise ValueError("zero-probability target states must agree across sources")
+        factors = np.ones_like(priors)
+        np.divide(common_prior, priors, out=factors, where=priors > 0)
+        tables *= factors[:, :, None]
+        adjustment = float(np.max(np.abs(tables - original)))
+        return list(tables), adjustment
     tables = []
     common_prior = None
     adjustment = 0.0
@@ -101,8 +125,11 @@ def make_result(
     joint = posteriors * weights
     residual = None
     if garblings is not None:
-        residual = max(float(np.max(np.abs(table @ kernel - joint)))
-                       for table, kernel in zip(tables, garblings))
+        if all(table.shape == tables[0].shape for table in tables):
+            residual = float(np.max(np.abs(np.asarray(tables) @ np.asarray(garblings) - joint)))
+        else:
+            residual = max(float(np.max(np.abs(table @ kernel - joint)))
+                           for table, kernel in zip(tables, garblings))
     return RedundancyResult(
         max(0.0, information), prior, posteriors, weights,
         garblings, adjustment, residual,

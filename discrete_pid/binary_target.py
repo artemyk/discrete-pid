@@ -13,52 +13,60 @@ from typing import Iterable
 import numpy as np
 
 from ._common import Array, RedundancyResult, make_result, validate_joints
+from ._hull import lower_hull
 
 
 def _posterior_meet(tables: list[Array], p: float, atol: float) -> tuple[Array, Array]:
     # Extended precision reduces cancellation when computing tail moments and
     # collinearity. It does not make the implementation exact arithmetic.
     extended = np.longdouble
-    points = [(extended(0), extended(p)), (extended(1), extended(0))]
-    for table in tables:
-        table_ext = table.astype(extended)
-        # Match the common endpoints also in extended precision. Float row
-        # sums can otherwise introduce spurious slope changes near 0 or 1.
-        table_ext[0] *= (extended(1) - extended(p)) / table_ext[0].sum()
-        table_ext[1] *= extended(p) / table_ext[1].sum()
-        weights = table_ext.sum(axis=0)
-        positive = weights > 0
-        theta = table_ext[1, positive] / weights[positive]
-        weights = weights[positive]
-        order = np.argsort(theta, kind="stable")
-        theta, weights = theta[order], weights[order]
-        tail_mass = np.cumsum(weights[::-1], dtype=extended)[::-1]
-        tail_moment = np.cumsum((weights * theta)[::-1], dtype=extended)[::-1]
-        call_values = np.maximum(tail_moment - theta * tail_mass, 0)
-        # The common endpoints are known exactly from the specified prior.
-        interior = (theta > 0) & (theta < 1)
-        points.extend(zip(theta[interior], call_values[interior]))
+    if all(table.shape == tables[0].shape for table in tables):
+        # Equal source alphabets can be processed in one NumPy batch.
+        batch = np.asarray(tables, dtype=extended)
+        batch[:, 0] *= ((extended(1) - extended(p)) / batch[:, 0].sum(axis=1))[:, None]
+        batch[:, 1] *= (extended(p) / batch[:, 1].sum(axis=1))[:, None]
+        weights = batch.sum(axis=1)
+        theta = np.zeros_like(weights)
+        np.divide(batch[:, 1], weights, out=theta, where=weights > 0)
+        order = np.argsort(theta, axis=1, kind="stable")
+        theta = np.take_along_axis(theta, order, axis=1)
+        weights = np.take_along_axis(weights, order, axis=1)
+        tail_mass = np.cumsum(weights[:, ::-1], axis=1, dtype=extended)[:, ::-1]
+        tail_moment = np.cumsum((weights * theta)[:, ::-1], axis=1, dtype=extended)[:, ::-1]
+        calls = np.maximum(tail_moment - theta * tail_mass, 0)
+        interior = (theta > 0) & (theta < 1) & (weights > 0)
+        locations = np.concatenate(([extended(0), extended(1)], theta[interior]))
+        heights = np.concatenate(([extended(p), extended(0)], calls[interior]))
+    else:
+        locations = [np.array([0, 1], dtype=extended)]
+        heights = [np.array([p, 0], dtype=extended)]
+        for table in tables:
+            table_ext = table.astype(extended)
+            # Match the common endpoints also in extended precision.
+            table_ext[0] *= (extended(1) - extended(p)) / table_ext[0].sum()
+            table_ext[1] *= extended(p) / table_ext[1].sum()
+            weights = table_ext.sum(axis=0)
+            positive = weights > 0
+            theta = table_ext[1, positive] / weights[positive]
+            weights = weights[positive]
+            order = np.argsort(theta, kind="stable")
+            theta, weights = theta[order], weights[order]
+            tail_mass = np.cumsum(weights[::-1], dtype=extended)[::-1]
+            tail_moment = np.cumsum((weights * theta)[::-1], dtype=extended)[::-1]
+            calls = np.maximum(tail_moment - theta * tail_mass, 0)
+            interior = (theta > 0) & (theta < 1)
+            locations.append(theta[interior])
+            heights.append(calls[interior])
+        locations, heights = np.concatenate(locations), np.concatenate(heights)
 
-    # Keeping only the lowest point at each abscissa is sufficient.
-    points.sort()
-    unique_points = []
-    for point in points:
-        if not unique_points or point[0] != unique_points[-1][0]:
-            unique_points.append(point)
-
-    hull = []
-    for point in unique_points:
-        while len(hull) >= 2:
-            a, b = hull[-2], hull[-1]
-            cross = ((b[0] - a[0]) * (point[1] - b[1])
-                     - (b[1] - a[1]) * (point[0] - b[0]))
-            if cross > 0:
-                break
-            hull.pop()
-        hull.append(point)
-
-    locations = np.asarray([point[0] for point in hull], dtype=extended)
-    heights = np.asarray([point[1] for point in hull], dtype=extended)
+    # NumPy sorts the coordinates in compiled code. At tied abscissae, keep
+    # only the lowest point, exactly as in the original lexicographic sort.
+    order = np.lexsort((heights, locations))
+    locations, heights = locations[order], heights[order]
+    unique = np.concatenate(([True], locations[1:] != locations[:-1]))
+    locations, heights = locations[unique], heights[unique]
+    hull = lower_hull(locations, heights)
+    locations, heights = locations[hull], heights[hull]
     slopes = np.diff(heights) / np.diff(locations)
     # The exact hull has slopes in [-1, 0]. Very short endpoint segments can
     # amplify roundoff in the divided differences; clipping preserves the

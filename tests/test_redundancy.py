@@ -2,11 +2,13 @@
 
 import unittest
 from functools import partial
+from unittest.mock import patch
 
 import numpy as np
 from scipy.optimize import linprog
 
 from discrete_pid import redundancy_binary_sources, redundancy_binary_target
+from discrete_pid import _hull
 
 
 def binary_entropy(p):
@@ -325,6 +327,74 @@ class RedundancyTests(unittest.TestCase):
             target = redundancy_binary_target(joints)
             self.assertAlmostEqual(result.redundancy_nats, target.redundancy_nats, places=11)
             self.assert_witness(joints, result)
+
+
+    def test_batched_and_ragged_target_paths_agree(self):
+        rng = np.random.default_rng(420)
+        for size in (2, 7, 32):
+            joints = [np.array([0.3, 0.7])[:, None] *
+                      rng.dirichlet(np.ones(size), size=2) for _ in range(5)]
+            original = [joint.copy() for joint in joints]
+            # Unequal zero padding forces the general validation/knot path.
+            ragged = [np.pad(joint, ((0, 0), (0, i))) for i, joint in enumerate(joints)]
+            batched = redundancy_binary_target(joints)
+            general = redundancy_binary_target(ragged)
+            self.assertAlmostEqual(batched.redundancy_nats, general.redundancy_nats, places=12)
+            self.assert_witness(joints, batched)
+            for joint, before in zip(joints, original):
+                np.testing.assert_array_equal(joint, before)
+
+    def test_batch_marginal_reconciliation_and_zero_support(self):
+        a = np.array([[0.2, 0.3], [0.1, 0.4]])
+        b = a + np.array([[1e-14, 0], [-1e-14, 0]])
+        batched = redundancy_binary_target([a, b])
+        general = redundancy_binary_target([a, np.pad(b, ((0, 0), (0, 1)))])
+        self.assertAlmostEqual(batched.redundancy_nats, general.redundancy_nats, places=12)
+        self.assertEqual(batched.input_adjustment, general.input_adjustment)
+        with self.assertRaisesRegex(ValueError, "zero-probability target"):
+            redundancy_binary_target([np.array([[1.0, 0], [0, 0]]),
+                                      np.array([[1 - 1e-14, 0], [1e-14, 0]])])
+
+    def test_exact_kernels_with_asymmetric_integer_intervals(self):
+        rng = np.random.default_rng(930)
+        prior_counts = np.array([40, 30, 25, 35, 50])
+        direction = np.array([-2, -1, 0, 1, 2])
+        for scale in (1, 10**100):
+            for _ in range(10):
+                counts = []
+                for _ in range(4):
+                    a, b = map(int, rng.integers(1, 10, size=2))
+                    joint = np.column_stack((b * (prior_counts - a * direction),
+                                             a * (prior_counts + b * direction)))
+                    if rng.integers(2):
+                        joint = joint[:, ::-1]
+                    counts.append(joint.astype(object) * scale)
+                result = redundancy_binary_sources(counts)
+                self.assertGreater(result.redundancy_nats, 0)
+                normalized = [np.array(j, dtype=float) / float(j.sum()) for j in counts]
+                self.assert_witness(normalized, result)
+
+    def test_hull_fallback_preserves_extended_precision(self):
+        x = np.array([0, 0.25, 0.5, 0.75, 1], dtype=np.longdouble)
+        y = np.array([0.5, 0.3, 0.12, 0.04, 0], dtype=np.longdouble)
+        expected = _hull._scan(x, y)
+        with patch.object(_hull, "_compiled_scan", None):
+            np.testing.assert_array_equal(_hull.lower_hull(x, y), expected)
+        if x.dtype != np.dtype(np.float64):
+            with patch.object(_hull, "_compiled_scan", side_effect=AssertionError("downcast")):
+                np.testing.assert_array_equal(_hull.lower_hull(x, y), expected)
+
+    @unittest.skipIf(_hull._compiled_scan is None, "Numba is optional")
+    def test_compiled_hull_matches_python(self):
+        rng = np.random.default_rng(37)
+        for count in (2, 13, 200):
+            x = np.sort(rng.random(count))
+            y = rng.random(count)
+            np.testing.assert_array_equal(_hull._compiled_scan(x, y), _hull._scan(x, y))
+        # Include exactly collinear knots and a very small positive turn.
+        x = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+        for y in (1 - x, (1 - x) + np.array([0, 0, -1e-15, 0, 0])):
+            np.testing.assert_array_equal(_hull._compiled_scan(x, y), _hull._scan(x, y))
 
 
 if __name__ == "__main__":

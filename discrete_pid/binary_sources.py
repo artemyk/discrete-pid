@@ -55,17 +55,23 @@ def redundancy_binary_sources(
 
     # Object arrays preserve Python integers before any NumPy coercion can
     # round large values or overflow fixed-width sums and cross-products.
-    raw = [np.asarray(joint, dtype=object) for joint in joints]
+    raw = [joint if isinstance(joint, np.ndarray) else np.asarray(joint, dtype=object)
+           for joint in joints]
     if not raw:
         raise ValueError("at least one source joint table is required")
     for index, joint in enumerate(raw):
         if joint.ndim != 2 or min(joint.shape) == 0:
             raise ValueError(f"joint {index} must be a nonempty two-dimensional table")
+        if joint.dtype.kind in "iuf":
+            continue
         if any(not isinstance(v, Real) or isinstance(v, (bool, np.bool_))
                for v in joint.flat):
             raise ValueError(f"joint {index} must contain real integer or floating-point values")
-    if all(isinstance(v, Integral) for joint in raw for v in joint.flat):
-        counts = [np.array([int(v) for v in joint.flat], dtype=object).reshape(joint.shape)
+    if all(joint.dtype.kind in "iu" or
+           (joint.dtype.kind == "O" and all(isinstance(v, Integral) for v in joint.flat))
+           for joint in raw):
+        counts = [joint.astype(object) if joint.dtype.kind in "iu" else
+                  np.array([int(v) for v in joint.flat], dtype=object).reshape(joint.shape)
                   for joint in raw]
         return _integer_sources(counts)
     if tolerance is None:
@@ -97,11 +103,18 @@ def _uninformative(tables: list[Array], adjustment: float = 0.0) -> RedundancyRe
     )
 
 
-def _probability(value: Fraction) -> float:
-    result = float(value)
-    if value > 0 and result == 0:
+def _ratio(numerator: int, denominator: int) -> float:
+    # Python's integer division handles arbitrarily large operands without
+    # first casting either operand to float. No Fraction reduction is needed
+    # when converting a probability for output only.
+    result = numerator / denominator
+    if numerator != 0 and result == 0:
         raise ArithmeticError("a positive probability is too small for floating-point output")
     return result
+
+
+def _probability(value: Fraction) -> float:
+    return _ratio(value.numerator, value.denominator)
 
 
 def _integer_sources(counts: list[np.ndarray]) -> RedundancyResult:
@@ -132,11 +145,12 @@ def _integer_sources(counts: list[np.ndarray]) -> RedundancyResult:
         active_columns.append(active)
 
     # These floating-point copies are used only to report results and residuals.
-    tables = [np.array([_probability(Fraction(v, total)) for v in joint.flat])
+    tables = [np.array([_ratio(v, total) for v in joint.flat])
               .reshape(joint.shape) for joint, total in zip(counts, totals)]
     direction = None
     pivot = None
     intervals = []
+    pivot_deltas = []
     for joint, total, marginal, active in zip(counts, totals, marginals, active_columns):
         if len(active) == 1:
             return _uninformative(tables)
@@ -153,9 +167,10 @@ def _integer_sources(counts: list[np.ndarray]) -> RedundancyResult:
         elif any(d * direction[pivot] != r * delta[pivot]
                  for d, r in zip(delta, direction)):
             return _uninformative(tables)
-        span = Fraction(delta[pivot], s0 * s1)
-        probability_one = Fraction(s1, total)
-        intervals.append((-probability_one * span, (1 - probability_one) * span))
+        # Cancel common factors algebraically before creating rational values.
+        intervals.append((Fraction(-delta[pivot], s0 * total),
+                          Fraction(delta[pivot], s1 * total)))
+        pivot_deltas.append(delta[pivot])
 
     lower = max(min(interval) for interval in intervals)
     upper = min(max(interval) for interval in intervals)
@@ -166,19 +181,29 @@ def _integer_sources(counts: list[np.ndarray]) -> RedundancyResult:
         # Every intersection endpoint is an original segment endpoint.
         index = next(i for i, interval in enumerate(intervals) if t in interval)
         x = active_columns[index][intervals[index].index(t)]
-        posteriors[:, q] = [_probability(Fraction(v, marginals[index][x]))
+        posteriors[:, q] = [_ratio(v, marginals[index][x])
                             for v in counts[index][:, x]]
 
     float_weights = np.array([_probability(w) for w in weights])
     garblings = []
-    for total, marginal, active, (t0, t1) in zip(
-        totals, marginals, active_columns, intervals
+    for total, marginal, active, delta in zip(
+        totals, marginals, active_columns, pivot_deltas
     ):
-        kernel = np.tile(float_weights, (len(marginal), 1))
+        kernel = np.empty((len(marginal), 2))
+        if len(marginal) > 2:
+            kernel[:] = float_weights
+        s0, s1 = marginal[active[0]], marginal[active[1]]
         for q, t in enumerate(endpoints):
-            lam = (t - t0) / (t1 - t0)
-            kernel[active[0], q] = _probability(weights[q] * (1 - lam) * total / marginal[active[0]])
-            kernel[active[1], q] = _probability(weights[q] * lam * total / marginal[active[1]])
+            # Substituting lambda=(t-t0)/(t1-t0) cancels the source masses.
+            # Keep numerator/denominator products as arbitrary-size integers;
+            # avoiding intermediate Fraction reductions saves work without
+            # changing the exact rational value of either kernel entry.
+            base = t.denominator * delta
+            shift = t.numerator * total
+            denominator = weights[q].denominator * base
+            numerator = weights[q].numerator
+            kernel[active[0], q] = _ratio(numerator * (base - shift * s1), denominator)
+            kernel[active[1], q] = _ratio(numerator * (base + shift * s0), denominator)
         garblings.append(kernel)
     return make_result(tables, posteriors, float_weights, 0.0, tuple(garblings))
 

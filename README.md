@@ -38,6 +38,12 @@ SciPy as well:
 python -m pip install ".[test]"
 ```
 
+Optional Numba acceleration is available with:
+
+```bash
+python -m pip install ".[speed]"
+```
+
 The package is installed from this repository; no PyPI release is assumed.
 
 ## Quick example
@@ -122,6 +128,24 @@ The binary-source function always returns garblings. For the binary-target
 function, use `return_garblings=True` and install `.[garblings]` or `.[test]`.
 This optional reconstruction solves linear programs and is **outside** the
 `O(N log N)` bound. Both fast algorithms run without SciPy by default.
+
+## Performance
+
+Equal-shaped source tables are validated and processed in NumPy batches.
+The binary-target solver also sorts knots with NumPy and, when Numba is
+installed, compiles the hull scan on platforms where `np.longdouble` has the
+same precision as `float64` (including Apple Silicon). The first call incurs
+compilation or cache-loading overhead; later calls reuse the compiled code.
+No `fastmath` or parallel reductions are used. On platforms with wider
+`longdouble`, the hull retains that precision and uses the Python scan;
+[Numba does not support extended-precision NumPy floats](https://numba.readthedocs.io/en/stable/reference/numpysupported.html#scalar-types).
+The package also works without Numba.
+
+Binary-source geometry remains in arbitrary-precision integer/rational
+arithmetic. Output conversion and kernel construction avoid unnecessary
+fraction reductions, and garbling residuals are checked in NumPy batches
+when shapes agree. These optimizations preserve the default exact
+collinearity checks and the explicit opt-in for floating-point inputs.
 
 ## Numerical behavior
 

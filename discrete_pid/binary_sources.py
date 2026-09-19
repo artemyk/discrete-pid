@@ -83,14 +83,20 @@ def redundancy_binary_sources(
 
     normalized = []
     for index, joint in enumerate(raw):
-        if any(v < 0 or (not isinstance(v, Integral) and not np.isfinite(v))
-               for v in joint.flat):
+        if joint.dtype.kind == "f" and joint.dtype.itemsize < 8:
+            joint = joint.astype(float)
+        if joint.dtype.kind == "O":
+            invalid = any(v < 0 or (not isinstance(v, Integral) and not np.isfinite(v))
+                          for v in joint.flat)
+        else:
+            invalid = np.any(joint < 0) or not np.all(np.isfinite(joint))
+        if invalid:
             raise ValueError(f"joint {index} must be finite and nonnegative")
-        scale = max(joint.flat)
+        scale = joint.max()
         if scale == 0:
             raise ValueError(f"joint {index} must have positive total mass")
         # Scale first to avoid overflowing a sum of large finite weights.
-        table = np.array([float(v / scale) for v in joint.flat]).reshape(joint.shape)
+        table = np.asarray(joint / scale, dtype=float)
         normalized.append(table / table.sum())
     tables, adjustment = validate_joints(normalized, atol)
     return _floating_sources(tables, adjustment, tolerance)
@@ -220,21 +226,18 @@ def _floating_sources(
             raise ValueError("every source must have at most two positive-probability states")
         sources.append((marginal, active, table[:, active] / marginal[active]))
 
-    def uninformative() -> RedundancyResult:
-        return _uninformative(tables, adjustment)
-
     direction = None
     pivot = None
     intervals = []
     for marginal, active, posterior in sources:
         if len(active) == 1:
-            return uninformative()
+            return _uninformative(tables, adjustment)
         delta = posterior[:, 1] - posterior[:, 0]
         scale = float(np.max(np.abs(delta)))
         # Only an exactly zero direction is discarded as uninformative;
         # tolerance does not erase weak but informative observations.
         if scale == 0:
-            return uninformative()
+            return _uninformative(tables, adjustment)
         unit = delta / scale
         if direction is None:
             pivot = int(np.argmax(np.abs(unit)))
@@ -243,7 +246,7 @@ def _floating_sources(
             # Account for a reversed ordering of a source's two states.
             sign = 1.0 if unit[pivot] >= 0 else -1.0
             if np.max(np.abs(sign * unit - direction)) > tolerance:
-                return uninformative()
+                return _uninformative(tables, adjustment)
         span = delta[pivot]
         # Barycentric weights place the prior at scalar coordinate zero.
         # This avoids subtracting nearly equal posterior and prior entries.
@@ -255,7 +258,7 @@ def _floating_sources(
     lower = max(min(interval) for interval in intervals)
     upper = min(max(interval) for interval in intervals)
     if not lower < 0 < upper:
-        return uninformative()
+        return _uninformative(tables, adjustment)
     weights = np.array([upper, -lower]) / (upper - lower)
     endpoints = np.array([lower, upper])
 

@@ -2,9 +2,8 @@
 
 Fast Python implementations of two special cases of **Blackwell redundancy**
 for discrete random variables. Given a target `Y` and sources `X_1, ..., X_k`,
-Blackwell redundancy maximizes `I(Y; Q)` over experiments `Q` obtainable by
-stochastic processing of **every** source. Each source can use a different
-processing kernel, but they must produce the same joint distribution `P(Y, Q)`.
+it maximizes `I(Y; Q)` over experiments `Q` obtainable by stochastic processing
+of **every** source, with a common joint distribution `P(Y, Q)`.
 
 | Function | Applicable inputs | Arithmetic cost |
 | --- | --- | --- |
@@ -12,16 +11,13 @@ processing kernel, but they must produce the same joint distribution `P(Y, Q)`.
 | `redundancy_binary_sources` | Arbitrary finite target; every source has at most two active states | `O(k d)` time for binary input tables |
 
 Here `N` is the total number of source states, `k` is the number of sources,
-and `d` is the number of target states. These are arithmetic-operation bounds;
-logarithm evaluation and arbitrary-precision bit costs are separate.
-If tables contain padded zero columns, reading them adds their input size.
-These functions compute redundancy and an optimal common experiment, rather
-than all atoms of a partial information decomposition.
+and `d` is the number of target states. Bounds exclude logarithm evaluation
+and integer bit costs; padded zero columns add their input size.
+The output is redundancy and an optimal common experiment, not all PID atoms.
 
 ## Install
 
-Requires Python 3.10 or newer. NumPy is the only required runtime dependency.
-From a checkout:
+Requires Python 3.10+ and NumPy. Install from this repository:
 
 ```bash
 git clone https://github.com/artemyk/discrete-pid.git
@@ -31,20 +27,13 @@ source .venv/bin/activate
 python -m pip install .
 ```
 
-For optional binary-target garbling reconstruction or the test suite, install
-SciPy as well:
+Optional extras add SciPy for garbling reconstruction and tests, or Numba
+for acceleration:
 
 ```bash
-python -m pip install ".[test]"
+python -m pip install ".[test]"   # SciPy
+python -m pip install ".[speed]"  # Numba
 ```
-
-Optional Numba acceleration is available with:
-
-```bash
-python -m pip install ".[speed]"
-```
-
-The package is installed from this repository; no PyPI release is assumed.
 
 ## Quick example
 
@@ -93,23 +82,19 @@ python examples/quickstart.py
 
 **Binary target.** Represent a source by its posterior probabilities
 `r = P(Y=1 | X_i)` and call function `C_i(t) = E[max(r - t, 0)]`.
-The meet is the greatest convex function below all source call functions.
-The implementation sorts their knots, constructs one lower convex hull, and
-recovers the optimal posterior probabilities and weights from its slope jumps.
+The meet is the greatest convex function below all source call functions:
+sort their knots, construct a lower convex hull, and recover posteriors and
+weights from its slope jumps.
 An optimal `Q` can have more than two outputs even when one source is binary.
 
-This is a posterior-coordinate implementation of the classical binary
-Blackwell meet construction described by
+This implements the classical binary Blackwell meet construction of
 [Bertschinger and Rauh (2014), Section 4](https://arxiv.org/abs/1401.3146).
-The underlying meet construction is not claimed as a new result here.
-In that reference the channel *input* is the variable called the *target* here.
+Their channel *input* is the variable called the *target* here.
 
 **All binary sources.** Each source has a posterior segment containing the
-prior. If two informative segments lie on different lines, their intersection
-is only the prior and redundancy is zero. Otherwise, intersect their scalar
-intervals. The endpoints and their unique mean-preserving weights define the
-meet. Source-to-meet garbling matrices are constructed directly. An
-uninformative source also forces zero redundancy.
+prior. An uninformative source or segments on distinct lines give zero
+redundancy. Otherwise, intersect their scalar intervals; the endpoints and
+mean-preserving weights define the meet. Garbling matrices follow directly.
 
 Both functions return a `RedundancyResult` with:
 
@@ -118,88 +103,62 @@ Both functions return a `RedundancyResult` with:
 - `posteriors`: a `(d, q)` array whose columns are `P(Y | Q)`.
 - `posterior_weights`: the vector `P(Q)`.
 - `target_auxiliary_joint`: the `(d, q)` table `P(Y, Q)`.
-- `garblings`: when available, matrices `K_i = P(Q | X_i)` with source states
-  on rows and auxiliary states on columns, satisfying `P(Y,X_i) @ K_i = P(Y,Q)`
-  to numerical precision, with normalized probabilities in this equality.
-  Auxiliary labels are arbitrary.
-- `max_garbling_residual`: the largest absolute entrywise error in these
-  equalities, or `None` when garblings were not requested.
-- `input_adjustment`: the largest absolute entrywise change made during
-  within-tolerance normalization or marginal reconciliation. For binary
-  sources, this is measured after converting weights to probabilities;
-  it is zero in integer mode.
+- `garblings`: matrices `K_i = P(Q | X_i)` of shape `(m_i, q)`, satisfying
+  `P(Y,X_i) @ K_i = P(Y,Q)` to numerical precision for normalized inputs.
+- `max_garbling_residual`: largest absolute entrywise error in this equality,
+  or `None` when garblings were not requested.
+- `input_adjustment`: largest entrywise change during within-tolerance
+  normalization or marginal reconciliation, measured after converting
+  binary-source weights to probabilities; zero in integer mode.
 
 The binary-source function always returns garblings. For the binary-target
-function, use `return_garblings=True` and install `.[garblings]` or `.[test]`.
-This optional reconstruction solves linear programs and is **outside** the
-`O(N log N)` bound. Both fast algorithms run without SciPy by default.
+function, use `return_garblings=True` with the SciPy extra. This optional
+reconstruction solves linear programs **outside** the `O(N log N)` bound.
 
 ## Performance
 
-Equal-shaped source tables are validated and processed in NumPy batches.
-The binary-target solver also sorts knots with NumPy and, when Numba is
-installed, compiles the hull scan on platforms where `np.longdouble` has the
-same precision as `float64` (including Apple Silicon). The first call incurs
-compilation or cache-loading overhead; later calls reuse the compiled code.
-No `fastmath` or parallel reductions are used. On platforms with wider
-`longdouble`, the hull retains that precision and uses the Python scan;
-[Numba does not support extended-precision NumPy floats](https://numba.readthedocs.io/en/stable/reference/numpysupported.html#scalar-types).
-The package also works without Numba.
-
-Binary-source geometry remains in arbitrary-precision integer/rational
-arithmetic. Output conversion and kernel construction avoid unnecessary
-fraction reductions, and garbling residuals are checked in NumPy batches
-when shapes agree. These optimizations preserve the default exact
-collinearity checks and the explicit opt-in for floating-point inputs.
+NumPy batches equal-shaped tables and sorts hull knots. Optional Numba
+compiles the binary-target hull scan where `np.longdouble` has `float64`
+precision (including Apple Silicon). Compilation or cache loading happens
+at import time, so the first solver call has no compilation overhead.
+Wider `longdouble` uses the Python scan to preserve precision, since
+[Numba does not support extended-precision floats](https://numba.readthedocs.io/en/stable/reference/numpysupported.html#scalar-types).
+The package works without Numba. Integer-source geometry always uses
+arbitrary-precision integer/rational arithmetic.
 
 ## Numerical behavior
 
-For binary sources, collinearity is sensitive: when the target has more than
-two states, an arbitrarily small perturbation can move posterior segments
-onto different lines and change positive redundancy to zero. Therefore
-`redundancy_binary_sources(joints, tolerance=None)` requires integer inputs.
-Use original integer counts or exact integer weights; **do not round or cast
-floating-point probabilities to integers** to bypass this check.
+With more than two target states, an arbitrarily small perturbation can
+move binary-source posterior segments onto different lines, changing positive
+redundancy to zero. Thus the default `tolerance=None` requires integer inputs.
+Use original counts or exact integer weights; **do not round or cast
+probabilities to integers** to bypass this check.
 
 - Integer tables may have different positive totals, but their normalized
-  target marginals must agree exactly. Collinearity is checked by integer
-  cross-products, and segment endpoints, weights, and garblings are computed
-  with rational arithmetic. Python arbitrary-size integers prevent overflow;
-  NumPy integer arrays and nested lists of integers are accepted. Supplying a
-  numerical `tolerance` does not weaken exact checks on integer-only inputs.
-- Floating-point tables, including integer-valued float arrays or a mixture
-  of integer and float tables, raise an informative error by default. To opt
-  into approximate geometry, explicitly pass a finite, nonnegative tolerance:
+  target marginals must agree exactly. Integer cross-products check
+  collinearity; rational arithmetic gives endpoints, weights, and garblings.
+  Arbitrary-size integers prevent overflow. NumPy integer arrays and nested
+  lists are accepted. A numerical `tolerance` does not weaken integer checks.
+- Any floating-point input requires a finite, nonnegative `tolerance`, even
+  if its values are integers. As in the example above, this compares posterior
+  directions scaled to maximum absolute coordinate one, allowing sign reversal.
+  Nearly aligned lines may be treated as collinear when exact redundancy is
+  zero. Neither `tolerance` nor a small `max_garbling_residual` bounds the
+  redundancy error; `tolerance=0` still uses floating-point arithmetic.
+- Floating-point binary-source tables may be unnormalized. After normalization,
+  target-marginal discrepancies within `atol` (default `1e-12`) are reconciled
+  by row scaling. `atol` neither controls collinearity nor permits float inputs.
+- Binary-target tables must sum to one within `atol`; normalization and marginal
+  discrepancies within `atol` are reconciled. The hull uses platform-dependent
+  extended precision and discards slope jumps at roundoff scale, so extremely
+  small atoms may be lost.
+- Outputs are floating point even with exact geometry. In integer mode, a
+  positive probability too small to represent raises `ArithmeticError`.
 
-  ```python
-  approximate = redundancy_binary_sources(
-      [joint.astype(float) for joint in counts], tolerance=1e-12
-  )
-  ```
-
-  `tolerance` compares posterior directions scaled to maximum absolute
-  coordinate one, allowing a sign reversal. It replaces `geometry_tol` from
-  the initial version. Nearly aligned but distinct lines may then be treated
-  as collinear, yielding a positive value where the exact value is zero.
-  Neither this tolerance nor a small `max_garbling_residual` bounds the error
-  in redundancy. `tolerance=0` still uses floating-point arithmetic.
-- In floating-point mode, binary-source tables may contain normalized
-  probabilities or unnormalized weights. After normalization, target-marginal
-  discrepancies within `atol` (default `1e-12`) are reconciled by row scaling.
-  `atol` does not control collinearity or permit float inputs by itself.
-- The binary-target solver continues to use floating-point arithmetic and
-  requires tables summing to one within `atol`; normalization and marginal
-  discrepancies within `atol` are reconciled. Its hull calculation uses
-  NumPy's platform-dependent extended precision; slope jumps at machine
-  roundoff scale are discarded, so extremely small atoms may be lost.
-- Both functions return floating-point probabilities and mutual information,
-  even when the geometry is computed exactly. In integer mode, a positive
-  probability too small to represent in the output raises `ArithmeticError`.
-  Inputs must be finite, nonnegative, nonempty, and have positive total mass.
-  Zero source columns are allowed; zero target rows must agree across sources.
-  Binary-target tables have exactly two rows, while binary-source tables have
-  any positive row count and at most two positive-mass columns. Input arrays
-  are not modified.
+Inputs must be finite, nonnegative, nonempty, and have positive total mass.
+Zero source columns are allowed; zero target rows must agree across sources.
+Binary-target tables have exactly two rows; binary-source tables have at most
+two positive-mass columns. Input arrays are not modified.
 
 ## Tests
 
@@ -208,12 +167,10 @@ python -m pip install ".[test]"
 python -m unittest discover -s tests -v
 ```
 
-Tests cover analytical examples, an independent LP check for random binary
-targets, agreement of the algorithms on their shared domain, garbling
-feasibility, permutations, degenerate variables, zero-probability states,
-exact integer collinearity below floating-point resolution, large integer
-counts, explicit floating-point tolerances, and invalid inputs. GitHub Actions
-runs the tests and the example script on Python 3.10, 3.12, and 3.13.
+Tests include analytical examples, an independent LP oracle, agreement of
+both algorithms, garbling feasibility, and numerical edge cases. GitHub
+Actions runs tests and examples on Python 3.10, 3.12, and 3.13, with a separate
+Numba check on Python 3.12.
 
 ## References and authorship
 
@@ -227,5 +184,4 @@ runs the tests and the example script on Python 3.10, 3.12, and 3.13.
 The code, tests, and documentation in this repository were written by
 **OpenAI Codex**, at Artemy Kolchinsky's request. The binary-target solver
 was adapted from the existing implementation in the BlackwellPID-Discrete
-research project. Mathematical ideas and prior constructions are credited
-above; code authorship does not imply mathematical originality.
+research project. Mathematical sources are credited above.

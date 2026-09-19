@@ -1,5 +1,7 @@
 """Analytical examples, witness checks, and an independent finite LP oracle."""
 
+import subprocess
+import sys
 import unittest
 from functools import partial
 from unittest.mock import patch
@@ -314,6 +316,36 @@ class RedundancyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "tolerance must"):
                     redundancy_binary_sources([counts], tolerance=tolerance)
 
+    def test_float_normalization_handles_large_weights_and_object_inputs(self):
+        reference = np.array([[0.2, 0.3], [0.3, 0.2]])
+        # The entries are finite, but their sum would overflow float64.
+        for joint in (np.array([[8e307, 12e307], [12e307, 8e307]]),
+                      reference.astype(object), reference.tolist(),
+                      reference.astype(np.float32)):
+            with self.subTest(input_type=type(joint)):
+                result = redundancy_binary_sources([joint], tolerance=1e-12)
+                normalized = np.array(joint, dtype=float)
+                normalized /= normalized.max()
+                normalized /= normalized.sum()
+                self.assertAlmostEqual(result.redundancy_nats,
+                                       mutual_information(normalized), places=7)
+                self.assert_witness([normalized], result)
+        for invalid in (np.nan, np.inf, -np.inf, -1.0):
+            for dtype in (float, object):
+                bad = np.array([[invalid, 1], [1, 1]], dtype=dtype)
+                with self.assertRaisesRegex(ValueError, "finite and nonnegative"):
+                    redundancy_binary_sources([bad], tolerance=1e-12)
+
+    @unittest.skipIf(_hull._compiled_scan is None, "Numba is optional")
+    def test_hull_is_compiled_at_import(self):
+        # Check in a fresh process, before any solver has run.
+        code = (
+            "from discrete_pid import _hull\n"
+            "assert _hull._compiled_scan.signatures\n"
+        )
+        run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_integer_and_target_algorithms_agree(self):
         rng = np.random.default_rng(726)
         for _ in range(20):
@@ -327,7 +359,6 @@ class RedundancyTests(unittest.TestCase):
             target = redundancy_binary_target(joints)
             self.assertAlmostEqual(result.redundancy_nats, target.redundancy_nats, places=11)
             self.assert_witness(joints, result)
-
 
     def test_batched_and_ragged_target_paths_agree(self):
         rng = np.random.default_rng(420)

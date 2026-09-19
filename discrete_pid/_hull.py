@@ -29,7 +29,9 @@ try:
 except ImportError:
     _compiled_scan = None
 else:
-    _compiled_scan = njit(cache=True)(_scan)
+    # An explicit signature compiles (or loads the cache) during import,
+    # so the first solver call has no compilation overhead.
+    _compiled_scan = njit("int64[::1](float64[::1], float64[::1])", cache=True)(_scan)
 
 
 def lower_hull(x, y):

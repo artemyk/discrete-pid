@@ -76,9 +76,14 @@ result = redundancy_binary_sources(counts)
 print(f"Redundancy: {result.redundancy_bits:.9f} bits")  # 0.043954630
 for joint, kernel in zip(counts, result.garblings):
     assert np.allclose((joint / joint.sum()) @ kernel, result.target_auxiliary_joint)
+
+# With floating-point probabilities, explicitly allow approximate collinearity.
+float_joints = [joint / joint.sum() for joint in counts]
+approximate = redundancy_binary_sources(float_joints, tolerance=1e-12)
+print(f"Redundancy: {approximate.redundancy_bits:.9f} bits")  # 0.043954630
 ```
 
-A runnable version of both examples is included:
+A runnable example of each algorithm is included:
 
 ```bash
 python examples/quickstart.py

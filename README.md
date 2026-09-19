@@ -43,8 +43,10 @@ The package is installed from this repository; no PyPI release is assumed.
 ## Quick example
 
 Each input is a joint probability table `P(Y, X_i)`: **rows are target states,
-columns are source states**. Every table sums to one, and all row sums must
-give the same target marginal. Source–target pairwise tables suffice; a full
+columns are source states**. All tables must give the same target marginal
+after normalization. The binary-target solver takes normalized probabilities;
+the binary-source solver takes **unnormalized integer counts by default**
+to preserve exact collinearity. Source–target pairwise tables suffice; a full
 joint distribution of all sources is not required.
 
 ```python
@@ -60,19 +62,14 @@ print(f"Redundancy: {result.redundancy_bits:.9f} bits")  # 0.331877754
 print(result.target_auxiliary_joint)  # P(Y, Q)
 
 # The second algorithm allows any target alphabet, but all sources must
-# be binary. These sources observe a three-state target.
-prior = np.ones(3) / 3
-direction = np.array([0.1, -0.1, 0.0])
-joints = []
-for lower, upper in [(-2.0, 1.0), (-1.0, 2.0)]:
-    weights = np.array([upper, -lower]) / (upper - lower)
-    posteriors = prior[:, None] + direction[:, None] * [lower, upper]
-    joints.append(posteriors * weights)
-
-result = redundancy_binary_sources(joints)
-print(f"Redundancy: {result.redundancy_bits:.9f} bits")
-for joint, kernel in zip(joints, result.garblings):
-    assert np.allclose(joint @ kernel, result.target_auxiliary_joint)
+# be binary. Supply integer counts, without dividing by their totals.
+# These sources observe a uniform three-state target.
+counts = [np.array([[4, 26], [16, 14], [10, 20]]),
+          np.array([[14, 16], [26, 4], [20, 10]])]
+result = redundancy_binary_sources(counts)
+print(f"Redundancy: {result.redundancy_bits:.9f} bits")  # 0.043954630
+for joint, kernel in zip(counts, result.garblings):
+    assert np.allclose((joint / joint.sum()) @ kernel, result.target_auxiliary_joint)
 ```
 
 A runnable version of both examples is included:
@@ -111,12 +108,15 @@ Both functions return a `RedundancyResult` with:
 - `posterior_weights`: the vector `P(Q)`.
 - `target_auxiliary_joint`: the `(d, q)` table `P(Y, Q)`.
 - `garblings`: when available, matrices `K_i = P(Q | X_i)` with source states
-  on rows and auxiliary states on columns, satisfying `joint_i @ K_i = P(Y,Q)`
-  to numerical precision. Auxiliary labels are arbitrary.
+  on rows and auxiliary states on columns, satisfying `P(Y,X_i) @ K_i = P(Y,Q)`
+  to numerical precision, with normalized probabilities in this equality.
+  Auxiliary labels are arbitrary.
 - `max_garbling_residual`: the largest absolute entrywise error in these
   equalities, or `None` when garblings were not requested.
 - `input_adjustment`: the largest absolute entrywise change made during
-  within-tolerance input normalization.
+  within-tolerance normalization or marginal reconciliation. For binary
+  sources, this is measured after converting weights to probabilities;
+  it is zero in integer mode.
 
 The binary-source function always returns garblings. For the binary-target
 function, use `return_garblings=True` and install `.[garblings]` or `.[test]`.
@@ -125,29 +125,52 @@ This optional reconstruction solves linear programs and is **outside** the
 
 ## Numerical behavior
 
-The mathematical algorithms are exact constructions. These implementations
-use floating-point arithmetic, not symbolic or interval arithmetic. They do
-not enumerate polytope vertices or discretize a posterior grid.
+For binary sources, collinearity is sensitive: when the target has more than
+two states, an arbitrarily small perturbation can move posterior segments
+onto different lines and change positive redundancy to zero. Therefore
+`redundancy_binary_sources(joints, tolerance=None)` requires integer inputs.
+Use original integer counts or exact integer weights; **do not round or cast
+floating-point probabilities to integers** to bypass this check.
 
-- Inputs must be finite, nonnegative, nonempty, and normalized. Discrepancies
-  in normalization or common target marginals within `atol` (default `1e-12`)
-  are reconciled to the first table by row scaling. The result describes these
-  processed tables. Input arrays are not modified.
-- Zero-probability source columns are allowed. Zero-probability target rows
-  must agree across sources. In the binary-target function, tables still
-  have exactly two rows; the binary-source function allows any positive row
-  count and at most two positive-mass source columns.
-- The hull calculation uses NumPy's extended-precision type where available,
-  whose precision is platform-dependent. Slope jumps at machine-roundoff
-  scale are discarded; extremely small atoms may therefore be lost.
-- For binary sources, `geometry_tol` (default `1e-12`) compares normalized
-  posterior directions. Blackwell redundancy can be discontinuous at exact
-  collinearity when the target has more than two states. Nearly aligned but
-  distinct lines may be classified as aligned within this tolerance, yielding
-  a positive value where the exact value is zero. A small garbling residual
-  does **not** certify closeness to the exact redundancy in that case.
-  `geometry_tol=0` requires equality of the floating-point directions but is
-  not a substitute for exact arithmetic.
+- Integer tables may have different positive totals, but their normalized
+  target marginals must agree exactly. Collinearity is checked by integer
+  cross-products, and segment endpoints, weights, and garblings are computed
+  with rational arithmetic. Python arbitrary-size integers prevent overflow;
+  NumPy integer arrays and nested lists of integers are accepted. Supplying a
+  numerical `tolerance` does not weaken exact checks on integer-only inputs.
+- Floating-point tables, including integer-valued float arrays or a mixture
+  of integer and float tables, raise an informative error by default. To opt
+  into approximate geometry, explicitly pass a finite, nonnegative tolerance:
+
+  ```python
+  approximate = redundancy_binary_sources(
+      [joint.astype(float) for joint in counts], tolerance=1e-12
+  )
+  ```
+
+  `tolerance` compares posterior directions scaled to maximum absolute
+  coordinate one, allowing a sign reversal. It replaces `geometry_tol` from
+  the initial version. Nearly aligned but distinct lines may then be treated
+  as collinear, yielding a positive value where the exact value is zero.
+  Neither this tolerance nor a small `max_garbling_residual` bounds the error
+  in redundancy. `tolerance=0` still uses floating-point arithmetic.
+- In floating-point mode, binary-source tables may contain normalized
+  probabilities or unnormalized weights. After normalization, target-marginal
+  discrepancies within `atol` (default `1e-12`) are reconciled by row scaling.
+  `atol` does not control collinearity or permit float inputs by itself.
+- The binary-target solver continues to use floating-point arithmetic and
+  requires tables summing to one within `atol`; normalization and marginal
+  discrepancies within `atol` are reconciled. Its hull calculation uses
+  NumPy's platform-dependent extended precision; slope jumps at machine
+  roundoff scale are discarded, so extremely small atoms may be lost.
+- Both functions return floating-point probabilities and mutual information,
+  even when the geometry is computed exactly. In integer mode, a positive
+  probability too small to represent in the output raises `ArithmeticError`.
+  Inputs must be finite, nonnegative, nonempty, and have positive total mass.
+  Zero source columns are allowed; zero target rows must agree across sources.
+  Binary-target tables have exactly two rows, while binary-source tables have
+  any positive row count and at most two positive-mass columns. Input arrays
+  are not modified.
 
 ## Tests
 
@@ -159,8 +182,9 @@ python -m unittest discover -s tests -v
 Tests cover analytical examples, an independent LP check for random binary
 targets, agreement of the algorithms on their shared domain, garbling
 feasibility, permutations, degenerate variables, zero-probability states,
-near-collinearity, and invalid inputs. GitHub Actions runs the tests and the
-example script on Python 3.10, 3.12, and 3.13.
+exact integer collinearity below floating-point resolution, large integer
+counts, explicit floating-point tolerances, and invalid inputs. GitHub Actions
+runs the tests and the example script on Python 3.10, 3.12, and 3.13.
 
 ## References and authorship
 

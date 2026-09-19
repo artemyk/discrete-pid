@@ -17,18 +17,14 @@ def main():
 
     # Three-state target, two binary sources. Their posterior intervals are
     # [-2,1] and [-1,2] along the line prior + t*direction.
-    prior = np.ones(3) / 3
-    direction = np.array([0.1, -0.1, 0.0])
-    joints = []
-    for lower, upper in [(-2.0, 1.0), (-1.0, 2.0)]:
-        weights = np.array([upper, -lower]) / (upper - lower)
-        posterior = prior[:, None] + direction[:, None] * [lower, upper]
-        joints.append(posterior * weights)
+    # Keep the joint tables as integer counts for exact collinearity checks.
+    joints = [np.array([[4, 26], [16, 14], [10, 20]]),
+              np.array([[14, 16], [26, 4], [20, 10]])]
     result = redundancy_binary_sources(joints)
     print(f"Binary sources: {result.redundancy_bits:.9f} bits")
     print("  P(Q):", result.posterior_weights)
     for joint, kernel in zip(joints, result.garblings):
-        np.testing.assert_allclose(joint @ kernel, result.target_auxiliary_joint,
+        np.testing.assert_allclose((joint / joint.sum()) @ kernel, result.target_auxiliary_joint,
                                    rtol=0, atol=1e-12)
     print("  Common experiment verified from both sources.")
 

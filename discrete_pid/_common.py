@@ -19,7 +19,9 @@ class RedundancyResult:
     P(Q=q). When present, ``garblings[i]`` is the row-stochastic matrix
     P(Q | X_i), with shape (number of source states, number of Q states).
     ``input_adjustment`` records the largest absolute change to an input
-    entry during within-tolerance normalization. Garbling residuals are
+    entry during within-tolerance normalization or marginal reconciliation.
+    For binary sources it is measured after converting weights to
+    probabilities, and is zero in integer mode. Garbling residuals are
     measured against the normalized inputs.
     """
 

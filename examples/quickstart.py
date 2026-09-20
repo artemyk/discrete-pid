@@ -17,16 +17,19 @@ def main():
 
     # Three-state target, two binary sources. Their posterior intervals are
     # [-2,1] and [-1,2] along the line prior + t*direction.
-    # Keep the joint tables as integer counts for exact collinearity checks.
-    joints = [np.array([[4, 26], [16, 14], [10, 20]]),
-              np.array([[14, 16], [26, 4], [20, 10]])]
-    result = redundancy_binary_sources(joints)
+    # Supply the prior and conditional weights with a constant row sum.
+    prior = np.ones(3) / 3
+    channels = np.array([[[4, 26], [16, 14], [10, 20]],
+                         [[14, 16], [26, 4], [20, 10]]], dtype=np.uint32)
+    result = redundancy_binary_sources(prior, channels)
     print(f"Binary sources: {result.redundancy_bits:.9f} bits")
     print("  P(Q):", result.posterior_weights)
-    for joint, kernel in zip(joints, result.garblings):
-        np.testing.assert_allclose((joint / joint.sum()) @ kernel, result.target_auxiliary_joint,
+    for channel, kernel in zip(channels / 30, result.garblings):
+        np.testing.assert_allclose((prior[:, None] * channel) @ kernel, result.target_auxiliary_joint,
                                    rtol=0, atol=1e-12)
     print("  Common experiment verified from both sources.")
+    approximate = redundancy_binary_sources(prior, channels / 30, tolerance=1e-12)
+    print(f"Floating channels: {approximate.redundancy_bits:.9f} bits")
 
 
 if __name__ == "__main__":

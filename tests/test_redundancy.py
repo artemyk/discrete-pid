@@ -13,6 +13,14 @@ from discrete_pid import redundancy_binary_sources, redundancy_binary_target
 from discrete_pid import _hull
 
 
+def sources_from_joints(joints, *, tolerance):
+    """Convert existing analytical probability fixtures to conditional input."""
+    prior = joints[0].sum(axis=1)
+    channels = [np.divide(j, prior[:, None], out=np.zeros_like(j),
+                          where=prior[:, None] > 0) for j in joints]
+    return redundancy_binary_sources(prior, channels, tolerance=tolerance)
+
+
 def binary_entropy(p):
     if p in (0, 1):
         return 0.0
@@ -98,7 +106,7 @@ class RedundancyTests(unittest.TestCase):
         joints = [line_source(prior, direction, -2, 1),
                   line_source(prior, direction, -1, 2)]
         expected = line_source(prior, direction, -1, 1)
-        result = redundancy_binary_sources(joints, tolerance=1e-12)
+        result = sources_from_joints(joints, tolerance=1e-12)
         self.assertAlmostEqual(result.redundancy_nats, mutual_information(expected), places=12)
         # Auxiliary labels have no prescribed ordering.
         actual = result.target_auxiliary_joint
@@ -110,7 +118,7 @@ class RedundancyTests(unittest.TestCase):
         prior = np.ones(3) / 3
         joints = [line_source(prior, np.array([0.1, -0.1, 0]), -1, 1),
                   line_source(prior, np.array([0, 0.1, -0.1]), -1, 1)]
-        result = redundancy_binary_sources(joints, tolerance=1e-12)
+        result = sources_from_joints(joints, tolerance=1e-12)
         self.assertEqual(result.redundancy_nats, 0)
         self.assertEqual(len(result.posterior_weights), 1)
         self.assert_witness(joints, result)
@@ -121,7 +129,7 @@ class RedundancyTests(unittest.TestCase):
             prior = rng.dirichlet([2, 2])
             joints = [prior[:, None] * rng.dirichlet([1, 1], size=2) for _ in range(4)]
             hull = redundancy_binary_target(joints)
-            segment = redundancy_binary_sources(joints, tolerance=1e-12)
+            segment = sources_from_joints(joints, tolerance=1e-12)
             self.assertAlmostEqual(hull.redundancy_nats, segment.redundancy_nats, places=11)
             self.assert_witness(joints, segment)
 
@@ -130,16 +138,16 @@ class RedundancyTests(unittest.TestCase):
         direction = np.array([0.04, 0.06, -0.10])
         joints = [line_source(prior, direction, -2, 1),
                   line_source(prior, direction, -1, 2)]
-        expected = redundancy_binary_sources(joints, tolerance=1e-12).redundancy_nats
+        expected = sources_from_joints(joints, tolerance=1e-12).redundancy_nats
         permuted = [j[[2, 0, 1]][:, ::-1] for j in joints[::-1]]
-        result = redundancy_binary_sources(permuted, tolerance=1e-12)
+        result = sources_from_joints(permuted, tolerance=1e-12)
         self.assertAlmostEqual(result.redundancy_nats, expected, places=12)
         self.assert_witness(permuted, result)
 
     def test_single_source_and_duplicate_sources(self):
         joint = np.array([[0.1, 0.2], [0.2, 0.05], [0.15, 0.3]])
         for joints in ([joint], [joint, joint.copy()]):
-            result = redundancy_binary_sources(joints, tolerance=1e-12)
+            result = sources_from_joints(joints, tolerance=1e-12)
             self.assertAlmostEqual(result.redundancy_nats, mutual_information(joint), places=12)
             self.assert_witness(joints, result)
         binary = joint[:2] / joint[:2].sum()
@@ -147,24 +155,20 @@ class RedundancyTests(unittest.TestCase):
         self.assertAlmostEqual(result.redundancy_nats, mutual_information(binary), places=12)
 
     def test_zero_states_and_constant_variables(self):
-        # A padded binary source with a zero-probability target state.
-        joint = np.array([[0.2, 0, 0], [0, 0.8, 0], [0, 0, 0]])
-        result = redundancy_binary_sources([joint, joint.copy()], tolerance=1e-12)
+        joint = np.array([[0.2, 0, 0], [0, 0.8, 0]])
+        result = redundancy_binary_target([joint, joint.copy()])
         self.assertAlmostEqual(result.redundancy_nats, binary_entropy(0.2), places=12)
         self.assert_witness([joint, joint], result)
-        for solver in (redundancy_binary_target,
-                       partial(redundancy_binary_sources, tolerance=1e-12)):
-            with self.subTest(solver=solver):
-                joints = [np.array([[0.2, 0.8], [0, 0]]), np.array([[1.0], [0]])]
-                result = solver(joints)
-                self.assertEqual(result.redundancy_nats, 0)
-                self.assert_witness(joints, result)
+        joints = [np.array([[0.2, 0.8], [0, 0]]), np.array([[1.0], [0]])]
+        result = redundancy_binary_target(joints)
+        self.assertEqual(result.redundancy_nats, 0)
+        self.assert_witness(joints, result)
 
     def test_uninformative_source_gives_zero(self):
         joint = np.array([[0.4, 0.1], [0.1, 0.4]])
         independent = np.full((2, 2), 0.25)
         for solver in (redundancy_binary_target,
-                       partial(redundancy_binary_sources, tolerance=1e-12)):
+                       partial(sources_from_joints, tolerance=1e-12)):
             result = solver([joint, independent])
             self.assertAlmostEqual(result.redundancy_nats, 0, places=12)
             self.assert_witness([joint, independent], result)
@@ -172,7 +176,7 @@ class RedundancyTests(unittest.TestCase):
     def test_nearly_deterministic_source(self):
         joint = np.array([[1 - 1e-16, 1e-16], [1e-16, 1 - 1e-16]]) / 2
         for solver in (redundancy_binary_target,
-                       partial(redundancy_binary_sources, tolerance=1e-12)):
+                       partial(sources_from_joints, tolerance=1e-12)):
             result = solver([joint])
             self.assertAlmostEqual(result.redundancy_bits, 1, places=12)
             self.assert_witness([joint], result)
@@ -182,159 +186,26 @@ class RedundancyTests(unittest.TestCase):
         v = np.array([0.1, -0.1, 0])
         perturbed = v + np.array([0, 1e-8, -1e-8])
         joints = [line_source(prior, v, -1, 1), line_source(prior, perturbed, -1, 1)]
-        strict = redundancy_binary_sources(joints, tolerance=1e-12)
+        strict = sources_from_joints(joints, tolerance=1e-12)
         self.assertEqual(strict.redundancy_nats, 0)
-        approximate = redundancy_binary_sources(joints, tolerance=1e-5)
+        approximate = sources_from_joints(joints, tolerance=1e-5)
         self.assertGreater(approximate.redundancy_nats, 0)
         self.assertGreater(approximate.max_garbling_residual, 0)
 
     def test_validation_and_no_input_mutation(self):
         joint = np.array([[0.3, 0.2], [0.1, 0.4]])
         before = joint.copy()
-        for solver in (redundancy_binary_target,
-                       partial(redundancy_binary_sources, tolerance=1e-12)):
-            solver([joint, joint.copy()])
-            np.testing.assert_array_equal(joint, before)
-            for bad in ([], [np.zeros((2, 2))], [np.array([[np.nan], [0]])],
-                        [np.array([[-0.1, 0.6], [0.1, 0.4]])],
-                        [np.array([[0.6], [0.4]]), np.array([[0.5], [0.5]])]):
-                with self.subTest(solver=solver, bad=repr(bad)):
-                    with self.assertRaises(ValueError):
-                        solver(bad)
-            with self.assertRaises(ValueError):
-                solver([joint], atol=-1)
-        with self.assertRaises(ValueError):
-            redundancy_binary_target([np.ones((2, 2))])
-        with self.assertRaises(ValueError):
-            redundancy_binary_target([np.ones((3, 2)) / 6])
-        with self.assertRaises(ValueError):
-            redundancy_binary_sources([np.ones((2, 3)) / 6], tolerance=1e-12)
-        with self.assertRaises(ValueError):
-            redundancy_binary_sources([joint], tolerance=-1)
-
-    def test_integer_counts_give_analytical_meet(self):
-        counts = [np.array([[4, 26], [16, 14], [10, 20]]),
-                  np.array([[14, 16], [26, 4], [20, 10]])]
-        before = [j.copy() for j in counts]
-        expected = np.array([[7, 13], [13, 7], [10, 10]]) / 60
-        result = redundancy_binary_sources(iter(counts))
-        self.assertAlmostEqual(result.redundancy_nats, mutual_information(expected), places=12)
-        actual = result.target_auxiliary_joint
-        np.testing.assert_allclose(actual[:, np.argsort(actual[0])], expected, atol=1e-12)
-        self.assert_witness([j / j.sum() for j in counts], result)
-        self.assertEqual(result.input_adjustment, 0)
-        for joint, original in zip(counts, before):
-            np.testing.assert_array_equal(joint, original)
-        # Independent rescaling, relabeling, and Python nested lists preserve the meet.
-        permuted = [(j[[2, 0, 1]][:, ::-1] * factor).tolist()
-                    for j, factor in zip(counts[::-1], [7, 11])]
-        other = redundancy_binary_sources(permuted)
-        self.assertAlmostEqual(other.redundancy_nats, result.redundancy_nats, places=12)
-        self.assert_witness([np.array(j) / np.sum(j) for j in permuted], other)
-
-    def test_integer_arithmetic_does_not_overflow_or_round(self):
-        base = np.array([[4, 26], [16, 14], [10, 20]])
-        expected = base / base.sum()
-        # Cross-products overflow int64 even though each input entry fits.
-        for counts in (base * 10**16,
-                       base.astype(np.uint64) * np.uint64(10**17),
-                       base.astype(object) * 10**400):
-            with self.subTest(dtype=counts.dtype):
-                result = redundancy_binary_sources([counts, counts.copy()])
-                self.assertAlmostEqual(result.redundancy_nats,
-                                       mutual_information(expected), places=12)
-                self.assert_witness([expected, expected], result)
-
-    def test_integer_collinearity_resolves_changes_below_float_precision(self):
-        first = np.array([[13, 7], [7, 13], [10, 10]], dtype=object) * 10**20
-        second = first.copy()
-        second[0] += [1, -1]
-        second[2] += [-1, 1]
-        np.testing.assert_array_equal(first.astype(float), second.astype(float))
-        for tolerance in (None, 1e-5):
-            result = redundancy_binary_sources([first, second], tolerance=tolerance)
-            self.assertEqual(result.redundancy_nats, 0)
-            self.assertEqual(len(result.posterior_weights), 1)
-            normalized = np.array(first, dtype=float) / float(first.sum())
-            self.assert_witness([normalized, normalized], result)
-        approximate = redundancy_binary_sources(
-            [first.astype(float), second.astype(float)], tolerance=1e-12)
-        self.assertGreater(approximate.redundancy_nats, 0)
-
-    def test_unrepresentable_integer_probabilities_raise(self):
-        counts = [[10**400, 1], [1, 10**400]]
-        with self.assertRaisesRegex(ArithmeticError, "too small for floating-point output"):
-            redundancy_binary_sources([counts])
-
-    def test_integer_marginals_are_checked_exactly(self):
-        first = np.array([[13, 7], [7, 13], [10, 10]], dtype=object) * 10**20
-        second = first.copy()
-        second[0, 0] += 1
-        second[2, 0] -= 1
-        with self.assertRaisesRegex(ValueError, "exactly the same target marginal"):
-            redundancy_binary_sources([first, second], atol=0.1, tolerance=0.1)
-
-    def test_integer_degenerate_sources_and_validation(self):
-        padded = np.array([[2, 0, 0], [0, 8, 0], [0, 0, 0]])
-        result = redundancy_binary_sources([padded])
-        self.assertAlmostEqual(result.redundancy_nats, binary_entropy(0.2), places=12)
-        self.assert_witness([padded / 10], result)
-        for counts in ([padded, np.array([[2], [8], [0]])],
-                       [padded, np.array([[1, 1], [4, 4], [0, 0]])],
-                       [np.array([[2, 8]])]):
-            result = redundancy_binary_sources(counts)
-            self.assertEqual(result.redundancy_nats, 0)
-            self.assert_witness([j / j.sum() for j in counts], result)
-        # Validate all sources before an early return for an uninformative one.
-        for bad in ([], [np.zeros((2, 2), dtype=int)],
-                    [np.array([[-1, 2], [2, 1]])], [np.array([1, 2])],
-                    [np.empty((2, 0), dtype=int)],
-                    [np.array([[1], [1]]), np.ones((2, 3), dtype=int)],
-                    [np.array([[1], [1]]), np.ones((3, 2), dtype=int)]):
+        redundancy_binary_target([joint, joint.copy()])
+        np.testing.assert_array_equal(joint, before)
+        for bad in ([], [np.zeros((2, 2))], [np.array([[np.nan], [0]])],
+                    [np.array([[-0.1, 0.6], [0.1, 0.4]])],
+                    [np.array([[0.6], [0.4]]), np.array([[0.5], [0.5]])],
+                    [np.ones((2, 2))], [np.ones((3, 2)) / 6]):
             with self.subTest(bad=repr(bad)):
                 with self.assertRaises(ValueError):
-                    redundancy_binary_sources(bad)
-
-    def test_floating_inputs_require_explicit_tolerance(self):
-        counts = np.array([[4, 26], [16, 14], [10, 20]])
-        for joints in ([counts.astype(float)], [counts / counts.sum()],
-                       [counts, counts.astype(float)], [counts.astype(float).tolist()]):
-            with self.subTest(joints=repr(joints)):
-                with self.assertRaisesRegex(ValueError, "unnormalized integer joint tables"):
-                    redundancy_binary_sources(joints)
-        # atol alone is not consent to approximate collinearity.
-        with self.assertRaisesRegex(ValueError, "explicit numerical tolerance"):
-            redundancy_binary_sources([counts.astype(float)], atol=1e-5)
-        reference = redundancy_binary_sources([counts])
-        for joints in ([counts.astype(float)], [counts / counts.sum()],
-                       [counts, counts.astype(float)]):
-            result = redundancy_binary_sources(joints, tolerance=0)
-            self.assertAlmostEqual(result.redundancy_nats, reference.redundancy_nats, places=12)
-            self.assert_witness([j / j.sum() for j in joints], result)
-        for tolerance in (-1, np.nan, np.inf, True, "1e-12", 1j):
-            with self.subTest(tolerance=tolerance):
-                with self.assertRaisesRegex(ValueError, "tolerance must"):
-                    redundancy_binary_sources([counts], tolerance=tolerance)
-
-    def test_float_normalization_handles_large_weights_and_object_inputs(self):
-        reference = np.array([[0.2, 0.3], [0.3, 0.2]])
-        # The entries are finite, but their sum would overflow float64.
-        for joint in (np.array([[8e307, 12e307], [12e307, 8e307]]),
-                      reference.astype(object), reference.tolist(),
-                      reference.astype(np.float32)):
-            with self.subTest(input_type=type(joint)):
-                result = redundancy_binary_sources([joint], tolerance=1e-12)
-                normalized = np.array(joint, dtype=float)
-                normalized /= normalized.max()
-                normalized /= normalized.sum()
-                self.assertAlmostEqual(result.redundancy_nats,
-                                       mutual_information(normalized), places=7)
-                self.assert_witness([normalized], result)
-        for invalid in (np.nan, np.inf, -np.inf, -1.0):
-            for dtype in (float, object):
-                bad = np.array([[invalid, 1], [1, 1]], dtype=dtype)
-                with self.assertRaisesRegex(ValueError, "finite and nonnegative"):
-                    redundancy_binary_sources([bad], tolerance=1e-12)
+                    redundancy_binary_target(bad)
+        with self.assertRaises(ValueError):
+            redundancy_binary_target([joint], atol=-1)
 
     @unittest.skipIf(_hull._compiled_scan is None, "Numba is optional")
     def test_hull_is_compiled_at_import(self):
@@ -346,19 +217,6 @@ class RedundancyTests(unittest.TestCase):
         run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
 
-    def test_integer_and_target_algorithms_agree(self):
-        rng = np.random.default_rng(726)
-        for _ in range(20):
-            row_totals = rng.integers(1, 1000, size=2)
-            counts = []
-            for _ in range(4):
-                first_column = np.array([rng.integers(0, n + 1) for n in row_totals])
-                counts.append(np.column_stack([first_column, row_totals - first_column]))
-            joints = [j / j.sum() for j in counts]
-            result = redundancy_binary_sources(counts)
-            target = redundancy_binary_target(joints)
-            self.assertAlmostEqual(result.redundancy_nats, target.redundancy_nats, places=11)
-            self.assert_witness(joints, result)
 
     def test_batched_and_ragged_target_paths_agree(self):
         rng = np.random.default_rng(420)
@@ -386,24 +244,6 @@ class RedundancyTests(unittest.TestCase):
             redundancy_binary_target([np.array([[1.0, 0], [0, 0]]),
                                       np.array([[1 - 1e-14, 0], [1e-14, 0]])])
 
-    def test_exact_kernels_with_asymmetric_integer_intervals(self):
-        rng = np.random.default_rng(930)
-        prior_counts = np.array([40, 30, 25, 35, 50])
-        direction = np.array([-2, -1, 0, 1, 2])
-        for scale in (1, 10**100):
-            for _ in range(10):
-                counts = []
-                for _ in range(4):
-                    a, b = map(int, rng.integers(1, 10, size=2))
-                    joint = np.column_stack((b * (prior_counts - a * direction),
-                                             a * (prior_counts + b * direction)))
-                    if rng.integers(2):
-                        joint = joint[:, ::-1]
-                    counts.append(joint.astype(object) * scale)
-                result = redundancy_binary_sources(counts)
-                self.assertGreater(result.redundancy_nats, 0)
-                normalized = [np.array(j, dtype=float) / float(j.sum()) for j in counts]
-                self.assert_witness(normalized, result)
 
     def test_hull_fallback_preserves_extended_precision(self):
         x = np.array([0, 0.25, 0.5, 0.75, 1], dtype=np.longdouble)

@@ -17,6 +17,8 @@ def redundancy_binary_sources(
     channels: Iterable[ArrayLike],
     *,
     tolerance: float | None = None,
+    return_channel: bool = False,
+    return_garblings: bool = False,
 ) -> RedundancyResult:
     """Compute the binary-source meet in O(k*d) operations.
 
@@ -35,6 +37,11 @@ def redundancy_binary_sources(
     decisions using uint64 products, without GCDs or arbitrary-size integers.
     Returned probabilities and information use floating point. Optional Numba
     compiles the integer scan at import; the same algorithm works without it.
+
+    Set return_channel=True to return P(Q|Y) in result.channel, together with
+    posteriors and posterior weights. Independently, return_garblings=True
+    constructs P(Q|X_i). Both flags default to False; omitted outputs are None.
+    Garbling construction and residual evaluation are skipped unless requested.
 
     Floating-point channels require a finite nonnegative ``tolerance``.
     Their rows may contain unnormalized weights. Collinearity is compared on
@@ -76,8 +83,8 @@ def redundancy_binary_sources(
                 "integer channels need the same positive row sum within each source "
                 "on the positive-prior support; supply conditional weights, not joint counts"
             )
-        probabilities = counts / denominator[:, None, None]
-        meet, kernels = _source_scan.geometry(counts, support)
+        probabilities = counts / denominator[:, None, None] if return_garblings else None
+        meet, kernels = _source_scan.geometry(counts, support, return_garblings)
     else:
         if tolerance is None:
             raise ValueError(
@@ -98,15 +105,17 @@ def redundancy_binary_sources(
         scaled = weights / np.where(scales > 0, scales, 1)[:, :, None]
         totals = scaled.sum(axis=2)
         probabilities = scaled / np.where(totals > 0, totals, 1)[:, :, None]
-        meet, kernels = _floating_geometry(probabilities, support, tolerance)
+        meet, kernels = _floating_geometry(probabilities, support, tolerance, return_garblings)
 
     # No marginal reconciliation is needed: every channel uses the same prior.
-    tables = probabilities * p[None, :, None]
+    tables = list(probabilities * p[None, :, None]) if return_garblings else None
     joint = p[:, None] * meet
     masses = joint.sum(axis=0)
     if np.any(masses <= 0):
         raise ArithmeticError("a positive probability is too small for floating-point output")
-    return make_result(list(tables), joint / masses, masses, 0.0, tuple(kernels))
+    return make_result(tables, joint / masses, masses, 0.0,
+                       tuple(kernels) if return_garblings else None,
+                       return_channel=return_channel, prior=p)
 
 
 def _prior(prior):
@@ -127,8 +136,9 @@ def _prior(prior):
     return p
 
 
-def _floating_geometry(channels, support, tolerance):
+def _floating_geometry(channels, support, tolerance, return_garblings=False):
     k, d, _ = channels.shape
+    kernel_count = k if return_garblings else 0
     active = np.flatnonzero(support)
     anchor = active[np.argmin(channels[0, active, 1])]
     pivot = active[np.argmax(channels[0, active, 1])]
@@ -136,11 +146,11 @@ def _floating_geometry(channels, support, tolerance):
     scales = np.max(np.abs(differences), axis=1)
     spans = channels[:, pivot, 1] - channels[:, anchor, 1]
     if np.any(scales == 0) or np.any(spans == 0):
-        return np.ones((d, 1)), np.ones((k, 2, 1))
+        return np.ones((d, 1)), np.ones((kernel_count, 2, 1))
     orientation = np.where(spans > 0, 1, -1)
     unit = differences / scales[:, None] * orientation[:, None]
     if np.any(np.abs(unit - unit[0]) > tolerance):
-        return np.ones((d, 1)), np.ones((k, 2, 1))
+        return np.ones((d, 1)), np.ones((kernel_count, 2, 1))
     increasing = (spans > 0).astype(int)
     indices = np.arange(k)
     alpha = channels[indices, anchor, increasing] / np.abs(spans)
@@ -150,6 +160,8 @@ def _floating_geometry(channels, support, tolerance):
     z = np.zeros(d)
     z[active] = unit[0]
     meet = np.column_stack((b + (1 - z), a + z)) / normalizer
+    if not return_garblings:
+        return meet, np.empty((0, 2, 2))
     kernels = np.empty((k, 2, 2))
     flip0, flip1 = (a - alpha) / normalizer, (b - beta) / normalizer
     kernels[indices, 1 - increasing, 1] = flip0

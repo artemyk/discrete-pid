@@ -1,6 +1,7 @@
 """Conditional-input validation, integer bounds, and an exact posterior oracle."""
 
 from fractions import Fraction as F
+from functools import partial
 import subprocess
 import sys
 import unittest
@@ -8,9 +9,11 @@ from unittest.mock import patch
 
 import numpy as np
 
-from discrete_pid import redundancy_binary_sources as solve, redundancy_binary_target
+from discrete_pid import redundancy_binary_sources, redundancy_binary_target
 from discrete_pid import _source_scan
 
+# These existing oracle/witness tests explicitly request both optional outputs.
+solve = partial(redundancy_binary_sources, return_channel=True, return_garblings=True)
 M = 2**32 - 1
 
 

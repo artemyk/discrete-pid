@@ -132,6 +132,7 @@ def _garbling(joint: Array, target_joint: Array, weights: Array, atol: float) ->
 def redundancy_binary_target(
     joints: Iterable[Array],
     *,
+    return_channel: bool = False,
     return_garblings: bool = False,
     atol: float = 1e-12,
 ) -> RedundancyResult:
@@ -143,8 +144,11 @@ def redundancy_binary_target(
     discretization or polytope-vertex enumeration. Arithmetic is floating
     point. Nats and bits are available on the returned result.
 
-    Set return_garblings=True to also reconstruct P(Q|X_i) with SciPy linear
-    programs. These LPs are not part of the O(N log N) hull bound.
+    Set return_channel=True to return P(Q|Y) in result.channel, together with
+    posteriors and posterior weights. Independently, return_garblings=True
+    reconstructs P(Q|X_i) with SciPy linear programs. Both flags default to
+    False, and omitted outputs are None. These LPs are not part of the
+    O(N log N) hull bound.
     Within-atol normalization and target-marginal discrepancies are reconciled
     to the first input; the largest adjustment is reported in the result.
     """
@@ -165,4 +169,5 @@ def redundancy_binary_target(
         else:
             garblings = tuple(_garbling(table, target_joint, weights, atol)
                               for table in tables)
-    return make_result(tables, posteriors, weights, adjustment, garblings)
+    return make_result(tables, posteriors, weights, adjustment, garblings,
+                       return_channel=return_channel)

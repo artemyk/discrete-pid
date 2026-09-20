@@ -10,7 +10,7 @@ def main():
     # channel, both observing the same fair bit.
     bsc = np.array([[0.45, 0.05], [0.05, 0.45]])
     bec = np.array([[0.25, 0.0, 0.25], [0.0, 0.25, 0.25]])
-    result = redundancy_binary_target([bsc, bec])
+    result = redundancy_binary_target([bsc, bec], return_channel=True)
     print(f"Binary target: {result.redundancy_bits:.9f} bits")
     print("  P(Y=1 | Q):", result.posteriors[1])
     print("  P(Q):", result.posterior_weights)
@@ -21,8 +21,10 @@ def main():
     prior = np.ones(3) / 3
     channels = np.array([[[4, 26], [16, 14], [10, 20]],
                          [[14, 16], [26, 4], [20, 10]]], dtype=np.uint32)
-    result = redundancy_binary_sources(prior, channels)
+    result = redundancy_binary_sources(prior, channels,
+                                       return_channel=True, return_garblings=True)
     print(f"Binary sources: {result.redundancy_bits:.9f} bits")
+    print("  P(Q|Y):", result.channel)
     print("  P(Q):", result.posterior_weights)
     for channel, kernel in zip(channels / 30, result.garblings):
         np.testing.assert_allclose((prior[:, None] * channel) @ kernel, result.target_auxiliary_joint,

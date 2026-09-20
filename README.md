@@ -51,7 +51,7 @@ from discrete_pid import redundancy_binary_target, redundancy_binary_sources
 # and a three-output binary erasure channel.
 bsc = np.array([[0.45, 0.05], [0.05, 0.45]])
 bec = np.array([[0.25, 0.0, 0.25], [0.0, 0.25, 0.25]])
-result = redundancy_binary_target([bsc, bec])
+result = redundancy_binary_target([bsc, bec], return_channel=True)
 print(f"Redundancy: {result.redundancy_bits:.9f} bits")  # 0.331877754
 print(result.target_auxiliary_joint)  # P(Y, Q)
 
@@ -60,7 +60,8 @@ print(result.target_auxiliary_joint)  # P(Y, Q)
 prior = np.array([1/3, 1/3, 1/3])
 channels = np.array([[[4, 26], [16, 14], [10, 20]],
                      [[14, 16], [26, 4], [20, 10]]], dtype=np.uint32)
-result = redundancy_binary_sources(prior, channels)
+result = redundancy_binary_sources(prior, channels,
+                                   return_channel=True, return_garblings=True)
 print(f"Redundancy: {result.redundancy_bits:.9f} bits")  # 0.043954630
 for channel, kernel in zip(channels / 30, result.garblings):
     assert np.allclose((prior[:, None] * channel) @ kernel,
@@ -80,7 +81,8 @@ python examples/quickstart.py
 ## Binary-source input format
 
 ```python
-redundancy_binary_sources(prior, channels, *, tolerance=None)
+redundancy_binary_sources(prior, channels, *, tolerance=None,
+                          return_channel=False, return_garblings=False)
 ```
 
 - `prior`: a length-`d` vector of nonnegative target weights, normalized internally.
@@ -125,24 +127,41 @@ prior. An uninformative source or segments on distinct lines give zero
 redundancy. Otherwise, intersect their scalar intervals; the endpoints and
 mean-preserving weights define the meet. Garbling matrices follow directly.
 
-Both functions return a `RedundancyResult` with:
+Both functions return a `RedundancyResult`. **Both output flags default to
+`False` and are independent:**
 
-- `redundancy_nats` and `redundancy_bits`.
-- `target_prior`: `P(Y)`.
-- `posteriors`: a `(d, q)` array whose columns are `P(Y | Q)`.
-- `posterior_weights`: the vector `P(Q)`.
+```python
+result = redundancy_binary_sources(prior, channels)  # information only
+with_channel = redundancy_binary_sources(prior, channels, return_channel=True)
+with_garblings = redundancy_binary_sources(prior, channels, return_garblings=True)
+# The binary-target solver accepts the same two flags.
+```
+
+Always available:
+
+- `redundancy_nats`, `redundancy_bits`, and `target_prior` (`P(Y)`).
+- `input_adjustment`: normalization/marginal reconciliation adjustment for
+  binary-target inputs; zero for binary-source inputs.
+
+With `return_channel=True`:
+
+- `channel`: the row-stochastic `(d, q)` matrix **`P(Q | Y)`**.
+- `posteriors`: the `(d, q)` matrix `P(Y | Q)`.
+- `posterior_weights`: `P(Q)`.
 - `target_auxiliary_joint`: the `(d, q)` table `P(Y, Q)`.
-- `garblings`: matrices `K_i = P(Q | X_i)` of shape `(m_i, q)`, satisfying
-  `P(Y,X_i) @ K_i = P(Y,Q)` to numerical precision for normalized inputs.
-- `max_garbling_residual`: largest absolute entrywise error in this equality,
-  or `None` when garblings were not requested.
-- `input_adjustment`: largest entrywise change during within-tolerance
-  normalization or marginal reconciliation for binary-target inputs; zero
-  for binary-source inputs, whose weights define their normalization.
 
-The binary-source function always returns garblings. For the binary-target
-function, use `return_garblings=True` with the SciPy extra. This optional
-reconstruction solves linear programs **outside** the `O(N log N)` bound.
+With `return_garblings=True`:
+
+- `garblings`: a tuple of `(m_i, q)` matrices **`P(Q | X_i)`**, satisfying
+  `P(Y,X_i) @ K_i = P(Y,Q)` to numerical precision.
+- `max_garbling_residual`: largest absolute entrywise error in this equality.
+
+Unrequested fields are `None`. Requesting garblings does not implicitly enable
+channel output, or vice versa. Garbling construction and residual evaluation
+are skipped by default. The binary-target solver requires the SciPy extra for
+nontrivial garbling reconstruction; its LPs lie outside the `O(N log N)` bound.
+On zero-prior target rows, the returned channel is set to `P(Q)` as an arbitrary
+stochastic extension; the joint-distribution identities are unaffected.
 
 ## Performance and numerical behavior
 

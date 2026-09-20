@@ -10,7 +10,7 @@ laws, all couplings take O(N+k*q) additional operations and storage.
 
 from __future__ import annotations
 
-from numbers import Integral, Real
+from numbers import Real
 from typing import Iterable, TYPE_CHECKING
 
 import numpy as np
@@ -18,7 +18,7 @@ from numpy.typing import ArrayLike
 
 from ._common import Array, RedundancyResult, make_result, normalize_prior
 from ._hull import lower_hull
-from ._validation import validate_row_sums
+from ._validation import integer_weights, normalize_rows, validate_row_sums
 from ._martingale import inverse_transform, sparse_rows
 
 if TYPE_CHECKING:
@@ -55,30 +55,10 @@ def _channel_batches(channels, prior):
 
 
 def _normalize_channels(raw, prior):
-    integer = raw.dtype.kind in 'iu'
-    if raw.dtype.kind == 'O':
-        if any(not isinstance(v, Real) or isinstance(v, (bool, np.bool_)) for v in raw.flat):
-            raise ValueError("channels must contain real integer or floating-point weights")
-        integer = all(isinstance(v, Integral) for v in raw.flat)
-    elif raw.dtype.kind not in 'iuf':
-        raise ValueError("channels must contain real integer or floating-point weights")
     active = prior > 0
-    if integer:
-        if np.any(raw < 0) or np.any(raw > np.iinfo(np.uint32).max):
-            raise ValueError("integer channel weights must be in [0, 2**32-1] (uint32 range)")
+    if integer_weights(raw):
         validate_row_sums(raw, active)
-    try:
-        weights = np.array(raw, dtype=np.longdouble, copy=True)
-    except (OverflowError, ValueError) as error:
-        raise ValueError("channel weights must be finite and nonnegative") from error
-    if not np.all(np.isfinite(weights)) or np.any(weights < 0):
-        raise ValueError("channel weights must be finite and nonnegative")
-    scales = weights.max(axis=2)
-    if np.any(scales[:, active] == 0):
-        raise ValueError("each channel row on the positive-prior support needs positive mass")
-    weights /= np.where(scales > 0, scales, 1)[:, :, None]
-    totals = weights.sum(axis=2)
-    weights /= np.where(totals > 0, totals, 1)[:, :, None]
+    weights = normalize_rows(raw, active, dtype=np.longdouble)
     weights *= prior[None, :, None]
     return weights
 
@@ -265,5 +245,5 @@ def redundancy_binary_target(
         garblings = tuple(_garbling(table, target_joint, weights, atol,
                                     support=support, source_order=order)
                           for table, order in zip(tables, source_orders))
-    return make_result(tables, posteriors, weights, 0.0, garblings,
-                       return_channel=return_channel, prior=prior)
+    return make_result(prior, posteriors, weights, tables=tables, garblings=garblings,
+                       return_channel=return_channel)

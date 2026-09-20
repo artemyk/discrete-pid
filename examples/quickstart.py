@@ -1,4 +1,4 @@
-"""Run with: python examples/quickstart.py (after installing the package)."""
+"""Run with: python examples/quickstart.py (after installing .[garblings])."""
 
 import numpy as np
 
@@ -10,10 +10,15 @@ def main():
     # channel, both observing the same fair bit.
     bsc = np.array([[9, 1], [1, 9]], dtype=np.uint32)
     bec = np.array([[5, 0, 5], [0, 5, 5]], dtype=np.uint32)
-    result = redundancy_binary_target([1, 1], [bsc, bec], return_channel=True)
+    result = redundancy_binary_target([1, 1], [bsc, bec],
+                                      return_channel=True, return_garblings=True)
     print(f"Binary target: {result.redundancy_bits:.9f} bits")
     print("  P(Y=1 | Q):", result.posteriors[1])
     print("  P(Q):", result.posterior_weights)
+    print("  P(Q|X_1):", result.garblings[0].toarray())
+    for channel, kernel in zip([bsc / 10, bec / 10], result.garblings):
+        np.testing.assert_allclose((0.5 * channel) @ kernel,
+                                   result.target_auxiliary_joint, rtol=0, atol=1e-12)
 
     # Three-state target, two binary sources. Their posterior intervals are
     # [-2,1] and [-1,2] along the line prior + t*direction.

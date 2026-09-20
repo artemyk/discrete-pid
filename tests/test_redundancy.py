@@ -221,7 +221,7 @@ class RedundancyTests(unittest.TestCase):
             joints = [np.array([0.3, 0.7])[:, None] *
                       rng.dirichlet(np.ones(size), size=2) for _ in range(5)]
             original = [joint.copy() for joint in joints]
-            # Unequal zero padding forces the general validation/knot path.
+            # Unequal zero padding puts the sources in separate batches.
             ragged = [np.pad(joint, ((0, 0), (0, i))) for i, joint in enumerate(joints)]
             batched = target_from_joints(joints, return_channel=True)
             general = target_from_joints(ragged, return_channel=True)

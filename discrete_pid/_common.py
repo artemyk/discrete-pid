@@ -71,17 +71,14 @@ def normalize_prior(prior):
 
 
 def make_result(
-    tables: list[Array] | None,
+    prior: Array,
     posteriors: Array,
     weights: Array,
-    adjustment: float,
-    garblings: tuple[Array | csr_matrix, ...] | None = None,
     *,
+    tables: list[Array] | None = None,
+    garblings: tuple[Array | csr_matrix, ...] | None = None,
     return_channel: bool = False,
-    prior: Array | None = None,
 ) -> RedundancyResult:
-    if prior is None:
-        prior = tables[0].sum(axis=1)
     # Extended precision limits cancellation near an uninformative experiment.
     r = np.asarray(posteriors[prior > 0], dtype=np.longdouble)
     p = np.asarray(prior[prior > 0], dtype=np.longdouble)
@@ -108,6 +105,6 @@ def make_result(
         redundancy_nats=max(0.0, information), target_prior=prior,
         posteriors=posteriors if return_channel else None,
         posterior_weights=weights if return_channel else None,
-        garblings=garblings, input_adjustment=adjustment,
+        garblings=garblings,
         max_garbling_residual=residual, channel=channel,
     )

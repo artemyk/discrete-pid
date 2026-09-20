@@ -12,7 +12,7 @@ import numpy as np
 from discrete_pid import redundancy_binary_sources, redundancy_binary_target
 from discrete_pid import _source_scan
 
-# These existing oracle/witness tests explicitly request both optional outputs.
+# Oracle checks need both channel and garbling outputs.
 solve = partial(redundancy_binary_sources, return_channel=True, return_garblings=True)
 M = 2**32 - 1
 
@@ -28,7 +28,7 @@ def joints(prior, channels):
 def posterior_oracle(prior, channels):
     """Independent Fraction implementation: intersect posterior intervals."""
     p = [F(int(v), sum(map(int, prior))) for v in prior]
-    posterior, intervals = [], []
+    intervals = []
     reference = None
     for table in channels:
         joint = [[p[y] * F(int(v), sum(map(int, row))) for v in row]
@@ -46,7 +46,6 @@ def posterior_oracle(prior, channels):
         if any(v * reference[pivot] != reference[y] * delta[pivot]
                for y, v in enumerate(delta)):
             return np.array([[float(v)] for v in p])
-        posterior.append(columns)
         intervals.append([(column[pivot] - p[pivot]) / reference[pivot]
                           for column in columns])
     lower = max(min(pair) for pair in intervals)
@@ -193,8 +192,11 @@ class ChannelTests(unittest.TestCase):
         for c in (np.array([[[8e307, 12e307], [12e307, 8e307]]]),
                   np.array([[[.4, .6], [.6, .4]]], dtype=object),
                   np.array([[[.4, .6], [.6, .4]]], dtype=np.float32)):
+            before = c.copy()
+            c.flags.writeable = False
             result = solve([8e307, 8e307], c, tolerance=1e-12)
             self.assertTrue(np.isfinite(result.redundancy_nats))
+            np.testing.assert_array_equal(c, before)
         for value in (np.nan, np.inf, -np.inf, -1.):
             with self.assertRaisesRegex(ValueError, 'finite and nonnegative'):
                 solve([1, 1], [[[value, 1], [1, 1]]], tolerance=1e-12)

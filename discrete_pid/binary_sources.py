@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from numbers import Integral, Real
+from numbers import Real
 from typing import Iterable
 
 import numpy as np
 from numpy.typing import ArrayLike
 
 from . import _source_scan
-from ._validation import validate_row_sums
+from ._validation import integer_weights, normalize_rows, validate_row_sums
 from ._common import RedundancyResult, make_result, normalize_prior
 
 
@@ -65,17 +65,7 @@ def redundancy_binary_sources(
     raw = np.asarray(channels if isinstance(channels, np.ndarray) else list(channels))
     if raw.ndim != 3 or raw.shape[0] == 0 or raw.shape[1:] != (len(p), 2):
         raise ValueError("channels must have shape (number of sources, target states, 2)")
-    integer = raw.dtype.kind in 'iu'
-    if raw.dtype.kind == 'O':
-        if any(not isinstance(v, Real) or isinstance(v, (bool, np.bool_)) for v in raw.flat):
-            raise ValueError("channels must contain real integer or floating-point weights")
-        integer = all(isinstance(v, Integral) for v in raw.flat)
-    elif raw.dtype.kind not in 'iuf':
-        raise ValueError("channels must contain real integer or floating-point weights")
-
-    if integer:
-        if np.any(raw < 0) or np.any(raw > np.iinfo(np.uint32).max):
-            raise ValueError("integer channel weights must be in [0, 2**32-1] (uint32 range)")
+    if integer_weights(raw):
         counts = np.array(raw, dtype=np.uint32, order='C', copy=True)
         validate_row_sums(counts, support)
         probabilities = None
@@ -91,19 +81,7 @@ def redundancy_binary_sources(
                 "(e.g. tolerance=1e-12): collinearity is sensitive to rounding. "
                 "Supply uint32 conditional weights with constant row sums for exact checks."
             )
-        try:
-            weights = np.asarray(raw, dtype=float)
-        except (OverflowError, ValueError) as error:
-            raise ValueError("channel weights must be finite and nonnegative") from error
-        if not np.all(np.isfinite(weights)) or np.any(weights < 0):
-            raise ValueError("channel weights must be finite and nonnegative")
-        scales = weights.max(axis=2)
-        if np.any(scales[:, support] == 0):
-            raise ValueError("each channel row on the positive-prior support needs positive mass")
-        # Scaling before summation permits even very large finite row weights.
-        scaled = weights / np.where(scales > 0, scales, 1)[:, :, None]
-        totals = scaled.sum(axis=2)
-        probabilities = scaled / np.where(totals > 0, totals, 1)[:, :, None]
+        probabilities = normalize_rows(raw, support)
         meet, kernels = _floating_geometry(probabilities, support, tolerance, return_garblings)
 
     # No marginal reconciliation is needed: every channel uses the same prior.
@@ -112,9 +90,9 @@ def redundancy_binary_sources(
     masses = joint.sum(axis=0)
     if np.any(masses <= 0):
         raise ArithmeticError("a positive probability is too small for floating-point output")
-    return make_result(tables, joint / masses, masses, 0.0,
-                       tuple(kernels) if return_garblings else None,
-                       return_channel=return_channel, prior=p)
+    return make_result(p, joint / masses, masses, tables=tables,
+                       garblings=tuple(kernels) if return_garblings else None,
+                       return_channel=return_channel)
 
 
 def _floating_geometry(channels, support, tolerance, return_garblings=False):

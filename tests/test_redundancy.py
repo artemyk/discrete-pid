@@ -240,6 +240,46 @@ class RedundancyTests(unittest.TestCase):
             with patch.object(_hull, "_compiled_scan", side_effect=AssertionError("downcast")):
                 np.testing.assert_array_equal(_hull.lower_hull(x, y), expected)
 
+    def test_envelope_keeps_lowest_duplicate_without_mutating_inputs(self):
+        for dtype in (np.float64, np.longdouble):
+            with self.subTest(dtype=dtype):
+                x = np.array([.5, 1, .25, .75, 0, .625,
+                              .5, .25, 1, .75, .5, 0], dtype=dtype)
+                y = np.array([.3, .1, .4, .1, .55, .1875,
+                              .125, .28125, 0, .03125, .2, .5], dtype=dtype)
+                before_x, before_y = x.copy(), y.copy()
+                x.setflags(write=False)
+                y.setflags(write=False)
+                locations, heights = binary_target._envelope(x, y)
+                # The lowest duplicate at each location comes later in the
+                # input. These five points are strictly convex; .625 is above.
+                np.testing.assert_array_equal(locations, [0, .25, .5, .75, 1])
+                np.testing.assert_array_equal(heights, [.5, .28125, .125, .03125, 0])
+                self.assertEqual(locations.dtype, np.dtype(dtype))
+                self.assertEqual(heights.dtype, np.dtype(dtype))
+                np.testing.assert_array_equal(x, before_x)
+                np.testing.assert_array_equal(y, before_y)
+
+    @unittest.skipUnless(np.finfo(np.longdouble).eps < np.finfo(float).eps,
+                         "longdouble is not wider than float64 on this platform")
+    def test_envelope_preserves_distinct_extended_precision_knots(self):
+        half = np.longdouble(.5)
+        delta = 4 * np.finfo(np.longdouble).eps
+        nearby = half + delta
+        height = np.longdouble(.125) - delta / 2
+        self.assertEqual(float(nearby), float(half))
+        x = np.array([1, nearby, half, 0, half, nearby], dtype=np.longdouble)
+        y = np.array([0, height + .0625, .25, .5, .125, height], dtype=np.longdouble)
+        locations, heights = binary_target._envelope(x, y)
+        # Both nearby points are genuine corners, with successive slopes
+        # approximately -.75, -.5, and -.25, even though float64 merges them.
+        np.testing.assert_array_equal(locations,
+                                      np.array([0, half, nearby, 1], dtype=np.longdouble))
+        np.testing.assert_array_equal(heights,
+                                      np.array([.5, .125, height, 0], dtype=np.longdouble))
+        self.assertEqual(locations.dtype, np.dtype(np.longdouble))
+        self.assertEqual(heights.dtype, np.dtype(np.longdouble))
+
     @unittest.skipIf(_hull._compiled_scan is None, "Numba is optional")
     def test_compiled_hull_matches_python(self):
         rng = np.random.default_rng(37)

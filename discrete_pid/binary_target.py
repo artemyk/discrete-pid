@@ -64,10 +64,11 @@ def _normalize_channels(raw, prior):
 
 
 def _envelope(locations, heights):
-    order = np.lexsort((heights, locations))
+    order = np.argsort(locations, kind="stable")
     locations, heights = locations[order], heights[order]
-    unique = np.concatenate(([True], locations[1:] != locations[:-1]))
-    locations, heights = locations[unique], heights[unique]
+    starts = np.flatnonzero(np.concatenate(([True], locations[1:] != locations[:-1])))
+    # Only the lowest knot at each location can belong to the lower hull.
+    locations, heights = locations[starts], np.minimum.reduceat(heights, starts)
     hull = lower_hull(locations, heights)
     return locations[hull], heights[hull]
 

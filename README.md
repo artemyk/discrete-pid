@@ -84,7 +84,8 @@ redundancy_binary_sources(prior, channels, *, tolerance=None,
 - `channels`: an iterable of `(d, m_i)` arrays, or a packed `(k, d, m)` array
   when source sizes agree. Binary targets require `d=2`; binary sources require
   every `m_i=2`. Inputs are never modified.
-- **Integer channels:** entries in `[0, 2**32 - 1]`; `np.uint32` is recommended.
+- **Integer channels (both solvers):** unnormalized weights in `[0, 2**32 - 1]`;
+  `np.uint32` is recommended.
   Every positive-prior row within a source must have the same positive sum `L_i`.
   The probabilities are `channels[i,y,x] / L_i`. Denominators may differ across
   sources and may exceed `uint32`. Other fitting integer dtypes/lists also work.

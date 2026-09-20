@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from . import _source_scan
+from ._validation import validate_row_sums
 from ._common import RedundancyResult, make_result, normalize_prior
 
 
@@ -76,14 +77,12 @@ def redundancy_binary_sources(
         if np.any(raw < 0) or np.any(raw > np.iinfo(np.uint32).max):
             raise ValueError("integer channel weights must be in [0, 2**32-1] (uint32 range)")
         counts = np.array(raw, dtype=np.uint32, order='C', copy=True)
-        totals = counts[:, :, 0].astype(np.uint64) + counts[:, :, 1]
-        denominator = totals[:, np.flatnonzero(support)[0]]
-        if np.any(denominator == 0) or np.any(totals[:, support] != denominator[:, None]):
-            raise ValueError(
-                "integer channels need the same positive row sum within each source "
-                "on the positive-prior support; supply conditional weights, not joint counts"
-            )
-        probabilities = counts / denominator[:, None, None] if return_garblings else None
+        validate_row_sums(counts, support)
+        probabilities = None
+        if return_garblings:
+            anchor = np.flatnonzero(support)[0]
+            denominator = counts[:, anchor, 0].astype(np.uint64) + counts[:, anchor, 1]
+            probabilities = counts / denominator[:, None, None]
         meet, kernels = _source_scan.geometry(counts, support, return_garblings)
     else:
         if tolerance is None:

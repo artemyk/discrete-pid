@@ -175,6 +175,12 @@ integer numerators used to construct garblings have the same bound.
 There are no GCDs or arbitrary-precision integers. Probabilities and mutual
 information are evaluated in floating point.
 
+Both solvers validate integer row sums with an optional Numba loop, compiled
+at import, that stops at the first mismatch. It avoids full source-by-target
+row-sum and comparison arrays; without Numba, the same bare loop runs in
+Python and the package warns once at import that installing `discrete-pid[speed]`
+is faster.
+
 Optional Numba compiles this scan and the binary-target hull scan at import,
 so solver calls have no compilation overhead. The package also works without
 Numba. On platforms with wider `np.longdouble`, the hull uses the Python scan

@@ -16,6 +16,7 @@ from numpy.typing import ArrayLike
 
 from ._common import Array, RedundancyResult, make_result, normalize_prior
 from ._hull import lower_hull
+from ._validation import validate_row_sums
 
 
 # Bound the arrays used for normalization, sorting, and suffix sums. Only
@@ -59,11 +60,7 @@ def _normalize_channels(raw, prior):
     if integer:
         if np.any(raw < 0) or np.any(raw > np.iinfo(np.uint32).max):
             raise ValueError("integer channel weights must be in [0, 2**32-1] (uint32 range)")
-        totals = np.asarray(raw, dtype=np.uint64).sum(axis=2, dtype=np.uint64)
-        denominator = totals[:, np.flatnonzero(active)[0]]
-        if np.any(denominator == 0) or np.any(totals[:, active] != denominator[:, None]):
-            raise ValueError("integer channels need the same positive row sum within each source "
-                             "on the positive-prior support; supply conditional weights, not joint counts")
+        validate_row_sums(raw, active)
     try:
         weights = np.array(raw, dtype=np.longdouble, copy=True)
     except (OverflowError, ValueError) as error:

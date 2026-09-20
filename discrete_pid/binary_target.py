@@ -8,23 +8,97 @@ reconstruction uses SciPy linear programs, outside that complexity bound.
 
 from __future__ import annotations
 
+from numbers import Integral, Real
 from typing import Iterable
 
 import numpy as np
+from numpy.typing import ArrayLike
 
-from ._common import Array, RedundancyResult, make_result, validate_joints
+from ._common import Array, RedundancyResult, make_result, normalize_prior
 from ._hull import lower_hull
 
 
-def _posterior_meet(tables: list[Array], p: float, atol: float) -> tuple[Array, Array]:
-    # Extended precision reduces cancellation when computing tail moments and
-    # collinearity. It does not make the implementation exact arithmetic.
+# Bound the arrays used for normalization, sorting, and suffix sums. Only
+# each batch's lower hull is retained for the final hull of their union.
+_BATCH_ENTRIES = 262144
+
+
+def _channel_batches(channels, prior):
+    if isinstance(channels, np.ndarray):
+        if channels.ndim != 3 or channels.shape[1] != 2 or channels.shape[2] == 0:
+            raise ValueError("channels must have shape (number of sources, 2, source states)")
+        step = max(1, _BATCH_ENTRIES // (2 * channels.shape[2]))
+        for start in range(0, len(channels), step):
+            yield _normalize_channels(channels[start:start + step], prior)
+        return
+    pending, entries, key = [], 0, None
+    for channel in channels:
+        raw = np.asarray(channel)
+        if raw.ndim != 2 or raw.shape[0] != 2 or raw.shape[1] == 0:
+            raise ValueError("each channel must have shape (2, source states)")
+        current = (raw.shape, raw.dtype)
+        if pending and (current != key or entries + raw.size > _BATCH_ENTRIES):
+            yield _normalize_channels(np.asarray(pending), prior)
+            pending, entries = [], 0
+        pending.append(raw)
+        entries += raw.size
+        key = current
+    if pending:
+        yield _normalize_channels(np.asarray(pending), prior)
+
+
+def _normalize_channels(raw, prior):
+    integer = raw.dtype.kind in 'iu'
+    if raw.dtype.kind == 'O':
+        if any(not isinstance(v, Real) or isinstance(v, (bool, np.bool_)) for v in raw.flat):
+            raise ValueError("channels must contain real integer or floating-point weights")
+        integer = all(isinstance(v, Integral) for v in raw.flat)
+    elif raw.dtype.kind not in 'iuf':
+        raise ValueError("channels must contain real integer or floating-point weights")
+    active = prior > 0
+    if integer:
+        if np.any(raw < 0) or np.any(raw > np.iinfo(np.uint32).max):
+            raise ValueError("integer channel weights must be in [0, 2**32-1] (uint32 range)")
+        totals = np.asarray(raw, dtype=np.uint64).sum(axis=2, dtype=np.uint64)
+        denominator = totals[:, np.flatnonzero(active)[0]]
+        if np.any(denominator == 0) or np.any(totals[:, active] != denominator[:, None]):
+            raise ValueError("integer channels need the same positive row sum within each source "
+                             "on the positive-prior support; supply conditional weights, not joint counts")
+    try:
+        weights = np.array(raw, dtype=np.longdouble, copy=True)
+    except (OverflowError, ValueError) as error:
+        raise ValueError("channel weights must be finite and nonnegative") from error
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0):
+        raise ValueError("channel weights must be finite and nonnegative")
+    scales = weights.max(axis=2)
+    if np.any(scales[:, active] == 0):
+        raise ValueError("each channel row on the positive-prior support needs positive mass")
+    weights /= np.where(scales > 0, scales, 1)[:, :, None]
+    totals = weights.sum(axis=2)
+    weights /= np.where(totals > 0, totals, 1)[:, :, None]
+    weights *= prior[None, :, None]
+    return weights
+
+
+def _envelope(locations, heights):
+    order = np.lexsort((heights, locations))
+    locations, heights = locations[order], heights[order]
+    unique = np.concatenate(([True], locations[1:] != locations[:-1]))
+    locations, heights = locations[unique], heights[unique]
+    hull = lower_hull(locations, heights)
+    return locations[hull], heights[hull]
+
+
+def _posterior_meet(batches, p, atol, tables):
     extended = np.longdouble
-    if all(table.shape == tables[0].shape for table in tables):
-        # Equal source alphabets can be processed in one NumPy batch.
-        batch = np.asarray(tables, dtype=extended)
-        batch[:, 0] *= ((extended(1) - extended(p)) / batch[:, 0].sum(axis=1))[:, None]
-        batch[:, 1] *= (extended(p) / batch[:, 1].sum(axis=1))[:, None]
+    pieces = []
+    seen = False
+    for batch in batches:
+        seen = True
+        if tables is not None:
+            tables.extend(np.asarray(batch, dtype=float))
+        if p == 0.0 or p == 1.0:
+            continue  # Still validate every input, even for a constant target.
         weights = batch.sum(axis=1)
         theta = np.zeros_like(weights)
         np.divide(batch[:, 1], weights, out=theta, where=weights > 0)
@@ -37,47 +111,25 @@ def _posterior_meet(tables: list[Array], p: float, atol: float) -> tuple[Array, 
         interior = (theta > 0) & (theta < 1) & (weights > 0)
         locations = np.concatenate(([extended(0), extended(1)], theta[interior]))
         heights = np.concatenate(([extended(p), extended(0)], calls[interior]))
+        # A point above a batch's lower hull cannot affect the global lower
+        # hull. This reduction is optional mathematically, and saves memory.
+        pieces.append(_envelope(locations, heights))
+    if not seen:
+        raise ValueError("at least one source channel is required")
+    if p == 0.0 or p == 1.0:
+        return np.array([p]), np.ones(1)
+    if len(pieces) == 1:
+        locations, heights = pieces[0]
     else:
-        locations = [np.array([0, 1], dtype=extended)]
-        heights = [np.array([p, 0], dtype=extended)]
-        for table in tables:
-            table_ext = table.astype(extended)
-            # Match the common endpoints also in extended precision.
-            table_ext[0] *= (extended(1) - extended(p)) / table_ext[0].sum()
-            table_ext[1] *= extended(p) / table_ext[1].sum()
-            weights = table_ext.sum(axis=0)
-            positive = weights > 0
-            theta = table_ext[1, positive] / weights[positive]
-            weights = weights[positive]
-            order = np.argsort(theta, kind="stable")
-            theta, weights = theta[order], weights[order]
-            tail_mass = np.cumsum(weights[::-1], dtype=extended)[::-1]
-            tail_moment = np.cumsum((weights * theta)[::-1], dtype=extended)[::-1]
-            calls = np.maximum(tail_moment - theta * tail_mass, 0)
-            interior = (theta > 0) & (theta < 1)
-            locations.append(theta[interior])
-            heights.append(calls[interior])
-        locations, heights = np.concatenate(locations), np.concatenate(heights)
-
-    # NumPy sorts the coordinates in compiled code. At tied abscissae, keep
-    # only the lowest point, exactly as in the original lexicographic sort.
-    order = np.lexsort((heights, locations))
-    locations, heights = locations[order], heights[order]
-    unique = np.concatenate(([True], locations[1:] != locations[:-1]))
-    locations, heights = locations[unique], heights[unique]
-    hull = lower_hull(locations, heights)
-    locations, heights = locations[hull], heights[hull]
+        locations, heights = _envelope(np.concatenate([a for a, _ in pieces]),
+                                       np.concatenate([b for _, b in pieces]))
     slopes = np.diff(heights) / np.diff(locations)
-    # The exact hull has slopes in [-1, 0]. Very short endpoint segments can
-    # amplify roundoff in the divided differences; clipping preserves the
-    # monotonicity of the slopes and avoids invalid endpoint atom weights.
+    # Short edges can amplify roundoff. The exact slopes are in [-1, 0].
     slopes = np.clip(slopes, -1, 0)
     masses = np.diff(np.concatenate(([extended(-1)], slopes, [extended(0)])))
     if np.min(masses) < -atol:
         raise ArithmeticError("numerical error produced an invalid posterior law")
     masses = np.maximum(masses, 0)
-    # Sub-precision slope jumps can otherwise create spurious output atoms.
-    # Use machine precision here, not the user's input-normalization tolerance.
     positive = masses > 8 * np.finfo(extended).eps
     support = np.asarray(locations[positive], dtype=float)
     weights = np.asarray(masses[positive], dtype=float)
@@ -130,36 +182,50 @@ def _garbling(joint: Array, target_joint: Array, weights: Array, atol: float) ->
 
 
 def redundancy_binary_target(
-    joints: Iterable[Array],
+    prior: ArrayLike,
+    channels: Iterable[ArrayLike],
     *,
     return_channel: bool = False,
     return_garblings: bool = False,
     atol: float = 1e-12,
 ) -> RedundancyResult:
-    """Compute redundancy for a binary target and arbitrary finite sources.
+    """Compute redundancy from a binary-target prior and conditional channels.
 
-    Inputs are joint tables P(Y,X_i), each of shape (2,m_i), with the same
-    target marginal. Zero-probability target and source states are allowed.
-    The lower hull yields an optimal common experiment without posterior
-    discretization or polytope-vertex enumeration. Arithmetic is floating
-    point. Nats and bits are available on the returned result.
+    ``prior`` contains two nonnegative target weights, normalized internally.
+    Each channel has shape (2,m_i), with target states as rows. A packed
+    (k,2,m) array, a list of differently sized channels, or an iterator works.
+
+    Integer channel weights must lie in [0,2**32-1], with the same positive
+    row sum within each source on the positive-prior support, as in the
+    binary-source solver. NumPy uint32 is recommended for compact storage.
+    Floating-point channels are accepted without a collinearity tolerance;
+    their rows may contain unnormalized weights and are normalized separately.
+    All entries must be finite and nonnegative. Zero-prior rows may be zero,
+    and zero source columns are allowed. Caller inputs are never modified.
+
+    Binary-target redundancy is continuous, so no exact collinearity decision
+    is needed. Both integer and floating inputs use floating-point hull
+    arithmetic, with extended precision where available. ``atol`` controls
+    numerical consistency checks (default 1e-12), not collinearity or an
+    error bound on redundancy. Very small posterior atoms may be lost to
+    roundoff. Bounded batches avoid full-size temporary matrices; their
+    lower hulls are combined in O(N log N) time and O(N) worst-case memory.
 
     Set return_channel=True to return P(Q|Y) in result.channel, together with
     posteriors and posterior weights. Independently, return_garblings=True
     reconstructs P(Q|X_i) with SciPy linear programs. Both flags default to
-    False, and omitted outputs are None. These LPs are not part of the
-    O(N log N) hull bound.
-    Within-atol normalization and target-marginal discrepancies are reconciled
-    to the first input; the largest adjustment is reported in the result.
+    False; omitted outputs are None. Only garbling reconstruction retains
+    all normalized joint tables, and its LPs lie outside the hull bound.
     """
-    tables, adjustment = validate_joints(joints, atol)
-    if tables[0].shape[0] != 2:
-        raise ValueError("a binary target requires joint tables of shape (2,m)")
-    p = float(tables[0][1].sum())
-    if p == 0.0 or p == 1.0:
-        support, weights = np.array([p]), np.ones(1)
-    else:
-        support, weights = _posterior_meet(tables, p, atol)
+    if (not isinstance(atol, Real) or isinstance(atol, (bool, np.bool_))
+            or not np.isfinite(atol) or atol <= 0):
+        raise ValueError("atol must be finite and positive")
+    prior = normalize_prior(prior)
+    if len(prior) != 2:
+        raise ValueError("a binary target requires a prior with two entries")
+    tables = [] if return_garblings else None
+    support, weights = _posterior_meet(_channel_batches(channels, prior),
+                                       float(prior[1]), atol, tables)
     posteriors = np.vstack((1 - support, support))
     garblings = None
     if return_garblings:
@@ -169,5 +235,5 @@ def redundancy_binary_target(
         else:
             garblings = tuple(_garbling(table, target_joint, weights, atol)
                               for table in tables)
-    return make_result(tables, posteriors, weights, adjustment, garblings,
-                       return_channel=return_channel)
+    return make_result(tables, posteriors, weights, 0.0, garblings,
+                       return_channel=return_channel, prior=prior)

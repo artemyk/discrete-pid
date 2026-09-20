@@ -18,7 +18,8 @@ class OutputFlagTests(unittest.TestCase):
                               ([1., 0.], informative)):
             channels = counts / counts.sum(axis=2, keepdims=True)
             joint = channels * np.array(prior)[None, :, None]
-            solvers = [partial(redundancy_binary_target, joint),
+            solvers = [partial(redundancy_binary_target, prior, counts),
+                       partial(redundancy_binary_target, prior, channels),
                        partial(redundancy_binary_sources, prior, counts),
                        partial(redundancy_binary_sources, prior, channels, tolerance=1e-12)]
             for solver in solvers:
@@ -53,8 +54,8 @@ class OutputFlagTests(unittest.TestCase):
     def test_default_target_never_calls_garbling_lp(self):
         joint = np.array([[.45, .05], [.05, .45]])
         with patch('discrete_pid.binary_target._garbling', side_effect=AssertionError('LP called')):
-            redundancy_binary_target([joint])
-            redundancy_binary_target([joint], return_channel=True)
+            redundancy_binary_target([.5, .5], [2 * joint])
+            redundancy_binary_target([.5, .5], [2 * joint], return_channel=True)
 
     def test_source_scan_omits_kernel_allocation_including_early_returns(self):
         for counts in (np.array([[[9, 1], [1, 9]]], dtype=np.uint32),

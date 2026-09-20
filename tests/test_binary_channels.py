@@ -226,7 +226,7 @@ class ChannelTests(unittest.TestCase):
             a = rng.integers(0, total + 1, size=(4, 2), dtype=np.uint64)
             c = np.stack((a, total - a), axis=-1).astype(np.uint32)
             result = self.assert_oracle(p, c)
-            other = redundancy_binary_target(joints(p, c))
+            other = redundancy_binary_target(p, c)
             self.assertAlmostEqual(result.redundancy_nats, other.redundancy_nats, places=11)
 
     def test_python_fallback_matches_compiled_scan(self):

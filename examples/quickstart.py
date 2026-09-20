@@ -8,9 +8,9 @@ from discrete_pid import redundancy_binary_sources, redundancy_binary_target
 def main():
     # Binary target: a binary symmetric channel and a three-state erasure
     # channel, both observing the same fair bit.
-    bsc = np.array([[0.45, 0.05], [0.05, 0.45]])
-    bec = np.array([[0.25, 0.0, 0.25], [0.0, 0.25, 0.25]])
-    result = redundancy_binary_target([bsc, bec], return_channel=True)
+    bsc = np.array([[9, 1], [1, 9]], dtype=np.uint32)
+    bec = np.array([[5, 0, 5], [0, 5, 5]], dtype=np.uint32)
+    result = redundancy_binary_target([1, 1], [bsc, bec], return_channel=True)
     print(f"Binary target: {result.redundancy_bits:.9f} bits")
     print("  P(Y=1 | Q):", result.posteriors[1])
     print("  P(Q):", result.posterior_weights)

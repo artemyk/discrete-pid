@@ -9,7 +9,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from . import _source_scan
-from ._common import RedundancyResult, make_result
+from ._common import RedundancyResult, make_result, normalize_prior
 
 
 def redundancy_binary_sources(
@@ -59,7 +59,7 @@ def redundancy_binary_sources(
         or not np.isfinite(tolerance) or tolerance < 0
     ):
         raise ValueError("tolerance must be None or a finite nonnegative number")
-    p = _prior(prior)
+    p = normalize_prior(prior)
     support = p > 0
     raw = np.asarray(channels if isinstance(channels, np.ndarray) else list(channels))
     if raw.ndim != 3 or raw.shape[0] == 0 or raw.shape[1:] != (len(p), 2):
@@ -116,24 +116,6 @@ def redundancy_binary_sources(
     return make_result(tables, joint / masses, masses, 0.0,
                        tuple(kernels) if return_garblings else None,
                        return_channel=return_channel, prior=p)
-
-
-def _prior(prior):
-    raw = np.asarray(prior)
-    if raw.ndim != 1 or raw.size == 0 or raw.dtype.kind not in 'iufO':
-        raise ValueError("prior must be a nonempty vector of real nonnegative weights")
-    try:
-        p = np.asarray(raw, dtype=float)
-    except (OverflowError, TypeError, ValueError) as error:
-        raise ValueError("prior weights must be finite and nonnegative") from error
-    if not np.all(np.isfinite(p)) or np.any(p < 0) or p.max() == 0:
-        raise ValueError("prior weights must be finite, nonnegative, and have positive mass")
-    positive = p > 0
-    p = p / p.max()
-    p /= p.sum()
-    if np.any(positive & (p == 0)):
-        raise ArithmeticError("a positive prior weight is too small for floating-point output")
-    return p
 
 
 def _floating_geometry(channels, support, tolerance, return_garblings=False):

@@ -37,10 +37,8 @@ python -m pip install ".[speed]"  # Numba
 
 ## Quick example
 
-The binary-target solver takes normalized joint tables `P(Y, X_i)`.
-The binary-source solver takes **a target prior and conditional channels
-`P(X_i | Y)`**. In both cases, rows are target states and columns are source
-states. Pairwise information suffices; a joint distribution of all sources
+Both solvers take **a target prior and conditional channels `P(X_i | Y)`**.
+Rows are target states and columns are source states. Pairwise information suffices; a joint distribution of all sources
 is not required.
 
 ```python
@@ -49,11 +47,13 @@ from discrete_pid import redundancy_binary_target, redundancy_binary_sources
 
 # A fair binary target observed through a binary symmetric channel
 # and a three-output binary erasure channel.
-bsc = np.array([[0.45, 0.05], [0.05, 0.45]])
-bec = np.array([[0.25, 0.0, 0.25], [0.0, 0.25, 0.25]])
-result = redundancy_binary_target([bsc, bec], return_channel=True)
+bsc = np.array([[9, 1], [1, 9]], dtype=np.uint32)
+bec = np.array([[5, 0, 5], [0, 5, 5]], dtype=np.uint32)
+result = redundancy_binary_target([1, 1], [bsc, bec], return_channel=True)
 print(f"Redundancy: {result.redundancy_bits:.9f} bits")  # 0.331877754
-print(result.target_auxiliary_joint)  # P(Y, Q)
+print(result.channel)  # P(Q | Y)
+# Binary targets also accept floats without a tolerance.
+floating = redundancy_binary_target([.5, .5], [bsc / 10, bec / 10])
 
 # Binary sources: a prior P(Y) and integer conditional weights.
 # Each channel has a constant row sum (30 here), used as its denominator.
@@ -67,7 +67,7 @@ for channel, kernel in zip(channels / 30, result.garblings):
     assert np.allclose((prior[:, None] * channel) @ kernel,
                        result.target_auxiliary_joint)
 
-# Floating channels require an explicit collinearity tolerance.
+# Binary-source floating channels require an explicit collinearity tolerance.
 approximate = redundancy_binary_sources(prior, channels / 30, tolerance=1e-12)
 print(f"Redundancy: {approximate.redundancy_bits:.9f} bits")  # 0.043954630
 ```
@@ -78,36 +78,39 @@ A runnable example of each algorithm is included:
 python examples/quickstart.py
 ```
 
-## Binary-source input format
+## Input format
 
 ```python
+redundancy_binary_target(prior, channels, *,
+                         return_channel=False, return_garblings=False, atol=1e-12)
 redundancy_binary_sources(prior, channels, *, tolerance=None,
                           return_channel=False, return_garblings=False)
 ```
 
-- `prior`: a length-`d` vector of nonnegative target weights, normalized internally.
-  Floating-point priors are allowed without a tolerance: only their support
-  enters the exact collinearity check.
-- `channels`: a list of `(d, 2)` arrays, or one `(k, d, 2)` array. By default,
-  entries must be integers in `[0, 2**32 - 1]`; `np.uint32` is recommended.
-  Other integer dtypes and nested lists are accepted if their values fit.
-- Within each channel, **every positive-prior row must have the same positive
-  sum `L_i`**. The entries represent `P(X_i=x | Y=y) = channels[i,y,x] / L_i`.
-  Different sources may have different denominators. The row sum itself may
-  exceed `uint32`; it is computed in `uint64`.
-- Zero-prior rows are ignored and may be all zero. A constant source still has
-  two columns, one of which may be zero. Inputs are never modified.
+- `prior`: nonnegative target weights, normalized internally; floats are allowed.
+  It has two entries for the binary-target solver, or `d` entries for binary sources.
+- `channels`: a list or iterable of `(d, m_i)` arrays. Rows are target states.
+  The target solver requires `d=2`; the source solver requires every `m_i=2`.
+  A packed `(k, d, m)` array works when source sizes agree.
+- **Integer channels:** entries in `[0, 2**32 - 1]`; `np.uint32` is recommended.
+  Every positive-prior row within a source must have the same positive sum `L_i`.
+  Entries represent `P(X_i=x | Y=y) = channels[i,y,x] / L_i`.
+  Denominators may differ across sources and may exceed `uint32`.
+- **Floating channels:** finite nonnegative row weights, normalized separately.
+  Binary targets accept these directly. Binary sources require an explicit finite,
+  nonnegative `tolerance` for approximate collinearity (see below).
+- Zero-prior rows are ignored and may be all zero. Zero source columns are allowed.
+  Inputs are never modified.
 
-This replaces the earlier joint-count API. General joint counts, or integer
-rows with different totals, cannot be passed as conditional weights. Supply
-an exact channel representation with a common denominator; do not round or
-cast probabilities to integers. Larger integer weights are rejected before
-conversion to `uint32`.
+This replaces the earlier joint-table APIs. To convert normalized joint tables,
+use `prior = joints[0].sum(axis=1)` and divide each positive-prior row by its
+prior probability. Do not pass general joint counts as integer conditional weights,
+round probabilities to integers, or cast oversized weights to `uint32`.
 
-With floating-point channels, explicitly set a finite, nonnegative `tolerance`.
-Rows may then contain unnormalized nonnegative weights and are normalized
-individually. Mixing floating-point and integer channels uses this approximate
-mode. A tolerance does not relax checks when all channels are integer.
+For binary sources, mixing floating and integer channels uses the approximate
+mode; a tolerance does not relax checks when all channels are integer.
+The binary-target solver validates integer channels individually, even in mixed lists,
+then uses floating-point arithmetic for all inputs.
 
 ## Algorithms and outputs
 
@@ -140,8 +143,8 @@ with_garblings = redundancy_binary_sources(prior, channels, return_garblings=Tru
 Always available:
 
 - `redundancy_nats`, `redundancy_bits`, and `target_prior` (`P(Y)`).
-- `input_adjustment`: normalization/marginal reconciliation adjustment for
-  binary-target inputs; zero for binary-source inputs.
+- `input_adjustment`: zero; the common prior is supplied directly and weights
+  are normalized by definition.
 
 With `return_channel=True`:
 
@@ -180,16 +183,23 @@ to preserve precision; Numba accelerates the hull when `longdouble` has
 
 With more than two target states, arbitrarily small perturbations can rotate
 posterior segments onto different lines and change positive redundancy to zero.
-That is why floating-point channels require explicit opt-in. The tolerance
+That is why the binary-source solver requires explicit opt-in for floating channels. The tolerance
 compares anchored channel differences scaled to maximum absolute coordinate
 one, allowing sign reversal. Neither it nor a small `max_garbling_residual`
 bounds the error in redundancy; `tolerance=0` still uses floating-point arithmetic.
 
-Binary-target tables must sum to one within `atol` (default `1e-12`) and have
-the same target marginal. Small discrepancies are reconciled. Their hull uses
+For a **binary target, redundancy is continuous** (Kolchinsky, 2022,
+Section 5.5 and Appendix D), so the discontinuous collinearity test is absent.
+Exact arithmetic is unnecessary for numerical evaluation: integer weights are
+normalized to floating point before computing the hull. The hull uses
 platform-dependent extended precision and discards slope jumps at roundoff
-scale, so extremely small atoms may be lost. All inputs must be finite and
-nonnegative; zero source columns are allowed for this solver.
+scale, so extremely small atoms may be lost. `atol` controls numerical
+consistency checks; it is not a collinearity tolerance or a redundancy error bound.
+
+The target solver processes bounded batches and retains only their lower hulls
+for the final hull of their union. This avoids full-input temporary matrices;
+worst-case working memory remains `O(N)`. Normalized joint tables are retained
+only when garblings are requested.
 
 ## Tests
 

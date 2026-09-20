@@ -51,9 +51,9 @@ class OutputFlagTests(unittest.TestCase):
                               'target_auxiliary_joint', 'garblings', 'max_garbling_residual'):
                     self.assertIsNone(getattr(default, field))
 
-    def test_default_target_never_calls_garbling_lp(self):
+    def test_default_target_skips_garbling_construction(self):
         joint = np.array([[.45, .05], [.05, .45]])
-        with patch('discrete_pid.binary_target._garbling', side_effect=AssertionError('LP called')):
+        with patch('discrete_pid.binary_target._garbling', side_effect=AssertionError('garbling called')):
             redundancy_binary_target([.5, .5], [2 * joint])
             redundancy_binary_target([.5, .5], [2 * joint], return_channel=True)
 

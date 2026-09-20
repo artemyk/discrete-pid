@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
 
 Array = NDArray[np.float64]
+
+if TYPE_CHECKING:
+    from scipy.sparse import csr_matrix
 
 
 @dataclass(frozen=True)
@@ -20,6 +24,8 @@ class RedundancyResult:
     to P(Q), an arbitrary stochastic extension. Independently, when requested
     with ``return_garblings=True``, ``garblings[i]`` is the row-stochastic matrix
     P(Q | X_i), with shape (number of source states, number of Q states).
+    Binary-target garblings are SciPy CSR matrices; binary-source garblings
+    are NumPy arrays. Sparse matrices can be converted with ``toarray()``.
     ``input_adjustment`` is zero: prior and channel weights are normalized
     by definition, without reconciling separately supplied target marginals.
     Garbling residuals use the joint distributions implied by these inputs.
@@ -29,7 +35,7 @@ class RedundancyResult:
     target_prior: Array
     posteriors: Array | None = None
     posterior_weights: Array | None = None
-    garblings: tuple[Array, ...] | None = None
+    garblings: tuple[Array | csr_matrix, ...] | None = None
     input_adjustment: float = 0.0
     max_garbling_residual: float | None = None
     channel: Array | None = None
@@ -69,7 +75,7 @@ def make_result(
     posteriors: Array,
     weights: Array,
     adjustment: float,
-    garblings: tuple[Array, ...] | None = None,
+    garblings: tuple[Array | csr_matrix, ...] | None = None,
     *,
     return_channel: bool = False,
     prior: Array | None = None,
@@ -88,7 +94,8 @@ def make_result(
     joint = posteriors * weights if return_channel or garblings is not None else None
     residual = None
     if garblings is not None:
-        if all(table.shape == tables[0].shape for table in tables):
+        if (all(isinstance(kernel, np.ndarray) for kernel in garblings)
+                and all(table.shape == tables[0].shape for table in tables)):
             residual = float(np.max(np.abs(np.asarray(tables) @ np.asarray(garblings) - joint)))
         else:
             residual = max(float(np.max(np.abs(table @ kernel - joint)))

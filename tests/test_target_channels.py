@@ -51,7 +51,7 @@ class TargetChannelTests(unittest.TestCase):
         result = solve([1, 0], [channel], return_channel=True, return_garblings=True)
         self.assertEqual(result.redundancy_nats, 0)
         np.testing.assert_array_equal(result.channel, np.ones((2, 1)))
-        np.testing.assert_array_equal(result.garblings[0], np.ones((3, 1)))
+        np.testing.assert_array_equal(result.garblings[0].toarray(), np.ones((3, 1)))
         # A degenerate prior still requires all other entries to be valid.
         with self.assertRaises(ValueError):
             solve([1, 0], [channel, np.array([[1., 0], [np.nan, 0]])])

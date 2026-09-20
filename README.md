@@ -13,6 +13,9 @@ of **every** source, with a common joint distribution `P(Y, Q)`.
 Here `N` is the total number of source states, `k` is the number of sources,
 and `d` is the number of target states. Bounds exclude logarithm evaluation
 and integer bit costs.
+Optional binary-target garblings take an additional `O(N + k q)` time after
+sorting and `O(N + k q)` sparse storage, where `q` is the number of output states.
+Since `q <= N`, their worst-case reconstruction cost is `O(k N)`.
 The output is redundancy and an optimal common experiment, not all PID atoms.
 
 ## Install
@@ -27,12 +30,12 @@ source .venv/bin/activate
 python -m pip install .
 ```
 
-Optional extras add SciPy for garbling reconstruction and tests, or Numba
-for acceleration:
+Optional extras add SciPy for sparse binary-target garblings and tests, or
+Numba for acceleration:
 
 ```bash
-python -m pip install ".[test]"   # SciPy
-python -m pip install ".[speed]"  # Numba
+python -m pip install ".[garblings]"  # SciPy sparse matrices; needed for the example below
+python -m pip install ".[speed]"      # Numba
 ```
 
 ## Quick example
@@ -49,9 +52,13 @@ from discrete_pid import redundancy_binary_target, redundancy_binary_sources
 # and a three-output binary erasure channel.
 bsc = np.array([[9, 1], [1, 9]], dtype=np.uint32)
 bec = np.array([[5, 0, 5], [0, 5, 5]], dtype=np.uint32)
-result = redundancy_binary_target([1, 1], [bsc, bec], return_channel=True)
+result = redundancy_binary_target([1, 1], [bsc, bec],
+                                  return_channel=True, return_garblings=True)
 print(f"Redundancy: {result.redundancy_bits:.9f} bits")  # 0.331877754
 print(result.channel)  # P(Q | Y)
+print(result.garblings[0].toarray())  # P(Q | X_1), stored as a SciPy CSR matrix
+for channel, kernel in zip([bsc / 10, bec / 10], result.garblings):
+    assert np.allclose((0.5 * channel) @ kernel, result.target_auxiliary_joint)
 # Binary targets also accept floats without a tolerance.
 floating = redundancy_binary_target([.5, .5], [bsc / 10, bec / 10])
 
@@ -124,6 +131,12 @@ An optimal `Q` can have more than two outputs even when one source is binary.
 This implements the classical binary Blackwell meet construction of
 [Bertschinger and Rauh (2014), Section 4](https://arxiv.org/abs/1401.3146).
 Their channel *input* is the variable called the *target* here.
+Optional garblings use the inverse-transform martingale coupling of
+[Jourdain and Margheriti](https://doi.org/10.1214/20-EJP543). In posterior
+coordinates, a garbling is the reverse conditional of a martingale coupling
+from `P(Y=1 | Q)` to `P(Y=1 | X_i)`. Merging quantile intervals and matching
+their mean deficits and excesses constructs sparse couplings without linear
+programming.
 
 **All binary sources.** Each source has a posterior segment containing the
 prior. An uninformative source or segments on distinct lines give zero
@@ -156,13 +169,16 @@ With `return_channel=True`:
 With `return_garblings=True`:
 
 - `garblings`: a tuple of `(m_i, q)` matrices **`P(Q | X_i)`**, satisfying
-  `P(Y,X_i) @ K_i = P(Y,Q)` to numerical precision.
+  `P(Y,X_i) @ K_i = P(Y,Q)` to numerical precision. Binary-target matrices are
+  SciPy CSR sparse matrices; binary-source matrices are dense NumPy arrays.
+  Use `K_i.toarray()` if a dense binary-target matrix is needed.
 - `max_garbling_residual`: largest absolute entrywise error in this equality.
 
 Unrequested fields are `None`. Requesting garblings does not implicitly enable
 channel output, or vice versa. Garbling construction and residual evaluation
-are skipped by default. The binary-target solver requires the SciPy extra for
-nontrivial garbling reconstruction; its LPs lie outside the `O(N log N)` bound.
+are skipped by default. Binary-target garblings require the SciPy extra for
+sparse storage; no linear programs are solved. Including these outputs gives
+`O(N log N + k q)` total time. Materializing dense matrices costs `O(N q)`.
 On zero-prior target rows, the returned channel is set to `P(Q)` as an arbitrary
 stochastic extension; the joint-distribution identities are unaffected.
 
@@ -181,10 +197,11 @@ row-sum and comparison arrays; without Numba, the same bare loop runs in
 Python and the package warns once at import that installing `discrete-pid[speed]`
 is faster.
 
-Optional Numba compiles this scan and the binary-target hull scan at import,
+Optional Numba compiles this scan, the binary-target hull scan, and the
+martingale coupling scan at import,
 so solver calls have no compilation overhead. The package also works without
-Numba. On platforms with wider `np.longdouble`, the hull uses the Python scan
-to preserve precision; Numba accelerates the hull when `longdouble` has
+Numba. On platforms with wider `np.longdouble`, the hull and martingale coupling
+use Python scans to preserve precision; Numba accelerates them when `longdouble` has
 `float64` precision, including Apple Silicon.
 
 With more than two target states, arbitrarily small perturbations can rotate
@@ -216,7 +233,8 @@ python -m unittest discover -s tests -v
 
 Tests include analytical examples, an independent LP oracle, agreement of
 both algorithms, an exact rational posterior oracle, garbling feasibility,
-`uint32` boundary cases, and compiled/Python fallback agreement. GitHub
+`uint32` boundary cases, sparse garblings from known feasible channels, and
+compiled/Python fallback agreement. GitHub
 Actions runs tests and examples on Python 3.10, 3.12, and 3.13, with a separate
 Numba check on Python 3.12.
 
@@ -228,6 +246,9 @@ Numba check on Python 3.12.
 - Nils Bertschinger and Johannes Rauh, [*The Blackwell relation defines no
   lattice*](https://arxiv.org/abs/1401.3146), 2014. Section 4 describes the
   binary-target lattice and its constructive meet.
+- Benjamin Jourdain and William Margheriti, [*A new family of one dimensional
+  martingale couplings*](https://doi.org/10.1214/20-EJP543), 2020. The
+  inverse-transform coupling supplies sparse binary-target garblings.
 
 The code, tests, and documentation in this repository were written by
 **OpenAI Codex**, at Artemy Kolchinsky's request. The binary-target solver

@@ -2,14 +2,16 @@
 
 This implements the classical binary-experiment meet in posterior coordinates;
 see Bertschinger and Rauh (2014), Section 4, https://arxiv.org/abs/1401.3146.
-The hull takes O(N log N) operations and O(N) memory. Optional source-garbling
-reconstruction uses SciPy linear programs, outside that complexity bound.
+The hull takes O(N log N) operations and O(N) memory. Optional sparse source
+garblings use the inverse-transform martingale coupling of Jourdain and
+Margheriti (2020), https://arxiv.org/abs/1808.01390. Given sorted posterior
+laws, all couplings take O(N+k*q) additional operations and storage.
 """
 
 from __future__ import annotations
 
 from numbers import Integral, Real
-from typing import Iterable
+from typing import Iterable, TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -17,6 +19,10 @@ from numpy.typing import ArrayLike
 from ._common import Array, RedundancyResult, make_result, normalize_prior
 from ._hull import lower_hull
 from ._validation import validate_row_sums
+from ._martingale import inverse_transform, sparse_rows
+
+if TYPE_CHECKING:
+    from scipy.sparse import csr_matrix
 
 
 # Bound the arrays used for normalization, sorting, and suffix sums. Only
@@ -86,7 +92,7 @@ def _envelope(locations, heights):
     return locations[hull], heights[hull]
 
 
-def _posterior_meet(batches, p, atol, tables):
+def _posterior_meet(batches, p, atol, tables, source_orders=None):
     extended = np.longdouble
     pieces = []
     seen = False
@@ -95,11 +101,15 @@ def _posterior_meet(batches, p, atol, tables):
         if tables is not None:
             tables.extend(np.asarray(batch, dtype=float))
         if p == 0.0 or p == 1.0:
+            if source_orders is not None:
+                source_orders.extend([None] * len(batch))
             continue  # Still validate every input, even for a constant target.
         weights = batch.sum(axis=1)
         theta = np.zeros_like(weights)
         np.divide(batch[:, 1], weights, out=theta, where=weights > 0)
         order = np.argsort(theta, axis=1, kind="stable")
+        if source_orders is not None:
+            source_orders.extend(order)
         theta = np.take_along_axis(theta, order, axis=1)
         weights = np.take_along_axis(weights, order, axis=1)
         tail_mass = np.cumsum(weights[:, ::-1], axis=1, dtype=extended)[:, ::-1]
@@ -136,42 +146,62 @@ def _posterior_meet(batches, p, atol, tables):
     return support, weights
 
 
-def _garbling(joint: Array, target_joint: Array, weights: Array, atol: float) -> Array:
+def _garbling(joint: Array, target_joint: Array, weights: Array, atol: float,
+              *, support: Array | None = None,
+              source_order: Array | None = None) -> csr_matrix:
+    """Construct P(Q|X) by a sparse inverse-transform martingale coupling.
+
+    Sort posterior laws, merge quantile cells, and exchange mass between
+    matched moment deficits/excesses. The source-conditional kernel follows
+    by dividing coupling rows by their mass. Zero-probability source states
+    are assigned deterministically to the first output. Sparse construction
+    and validation take O(m+q) work after sorting, without densifying K.
+    """
     try:
-        from scipy import sparse
-        from scipy.optimize import linprog
+        from scipy.sparse import csr_matrix
     except ImportError as exc:
         raise ImportError(
-            "Garbling reconstruction needs SciPy; install discrete-pid[garblings]"
+            "Sparse binary-target garblings need SciPy; install discrete-pid[garblings]"
         ) from exc
-    marginal = joint.sum(axis=0)
-    positive = marginal > 0
-    source = joint[:, positive]
-    source_count, auxiliary_count = source.shape[1], target_joint.shape[1]
-    constraints = sparse.vstack(
-        (
-            sparse.kron(sparse.eye(source_count), np.ones((1, auxiliary_count))),
-            sparse.kron(sparse.csr_matrix(source), sparse.eye(auxiliary_count)),
-        ),
-        format="csr",
-    )
-    rhs = np.concatenate((np.ones(source_count), target_joint.ravel()))
-    solution = linprog(
-        np.zeros(source_count * auxiliary_count),
-        A_eq=constraints,
-        b_eq=rhs,
-        bounds=(0.0, None),
-        method="highs",
-        options={"primal_feasibility_tolerance": 1e-10},
-    )
-    if not solution.success:
-        raise RuntimeError(f"garbling reconstruction failed: {solution.message}")
-    kernel = np.tile(weights, (joint.shape[1], 1))
-    positive_kernel = np.maximum(solution.x.reshape(source_count, auxiliary_count), 0)
-    row_sums = positive_kernel.sum(axis=1, keepdims=True)
-    if np.any(row_sums == 0):
-        raise ArithmeticError("garbling reconstruction produced an empty row")
-    kernel[positive] = positive_kernel / row_sums
+    m, q = joint.shape[1], len(weights)
+    if q == 1:
+        return csr_matrix((np.ones(m), np.zeros(m, dtype=np.int64),
+                           np.arange(m + 1)), shape=(m, 1))
+    extended = np.longdouble
+    joint_ext = np.asarray(joint, dtype=extended)
+    marginal = joint_ext.sum(axis=0)
+    active = (np.flatnonzero(marginal > 0) if source_order is None
+              else source_order[marginal[source_order] > 0])
+    theta = joint_ext[1, active] / marginal[active]
+    if source_order is None:
+        order = np.argsort(theta, kind="stable")
+        theta, active = theta[order], active[order]
+    positive = np.flatnonzero(weights > 0)
+    if support is None:
+        support = (np.asarray(target_joint[1, positive], dtype=extended)
+                   / np.asarray(weights[positive], dtype=extended))
+        output_order = np.argsort(support, kind="stable")
+        support, positive = support[output_order], positive[output_order]
+    else:
+        # The hull already supplies sorted output posteriors. Reuse them to
+        # avoid an O(q log q) sort for every source (and a round-trip division).
+        support = np.asarray(support[positive], dtype=extended)
+    rows, cols, data = inverse_transform(
+        np.ascontiguousarray(theta), np.ascontiguousarray(marginal[active]),
+        np.ascontiguousarray(support),
+        np.ascontiguousarray(weights[positive], dtype=extended))
+    rows, cols = active[rows], positive[cols]
+    data = np.asarray(data / marginal[rows], dtype=float)
+    missing = np.flatnonzero(marginal == 0)
+    rows = np.concatenate((rows, missing))
+    cols = np.concatenate((cols, np.zeros(len(missing), dtype=np.int64)))
+    data = np.concatenate((data, np.ones(len(missing))))
+    kernel = csr_matrix(sparse_rows(rows, cols, data, m), shape=(m, q))
+    row_sums = np.asarray(kernel.sum(axis=1)).ravel()
+    if not np.all(np.isfinite(kernel.data)) or np.any(row_sums <= 0):
+        raise ArithmeticError("garbling reconstruction produced an invalid row")
+    # Normalize in O(nnz) without constructing an m-by-q broadcast array.
+    kernel.data /= np.repeat(row_sums, np.diff(kernel.indptr))
     error = float(np.max(np.abs(joint @ kernel - target_joint)))
     if error > max(100 * atol, 1e-8):
         raise ArithmeticError(f"garbling reconstruction residual is too large: {error}")
@@ -210,9 +240,13 @@ def redundancy_binary_target(
 
     Set return_channel=True to return P(Q|Y) in result.channel, together with
     posteriors and posterior weights. Independently, return_garblings=True
-    reconstructs P(Q|X_i) with SciPy linear programs. Both flags default to
-    False; omitted outputs are None. Only garbling reconstruction retains
-    all normalized joint tables, and its LPs lie outside the hull bound.
+    reconstructs P(Q|X_i) as SciPy CSR matrices, using the inverse-transform
+    martingale coupling (no linear programming). Both flags default to False;
+    omitted outputs are None. Only garbling reconstruction retains all joint
+    tables. Coupling construction takes O(N+k*q) additional work/storage once
+    posterior laws are sorted, where q is the number of output states. Since
+    q<=N, the additional worst-case bound is O(k*N); dense conversion costs
+    O(N*q). SciPy is needed only when sparse garblings are requested.
     """
     if (not isinstance(atol, Real) or isinstance(atol, (bool, np.bool_))
             or not np.isfinite(atol) or atol <= 0):
@@ -221,16 +255,15 @@ def redundancy_binary_target(
     if len(prior) != 2:
         raise ValueError("a binary target requires a prior with two entries")
     tables = [] if return_garblings else None
+    source_orders = [] if return_garblings else None
     support, weights = _posterior_meet(_channel_batches(channels, prior),
-                                       float(prior[1]), atol, tables)
+                                       float(prior[1]), atol, tables, source_orders)
     posteriors = np.vstack((1 - support, support))
     garblings = None
     if return_garblings:
         target_joint = posteriors * weights
-        if len(weights) == 1:
-            garblings = tuple(np.ones((table.shape[1], 1)) for table in tables)
-        else:
-            garblings = tuple(_garbling(table, target_joint, weights, atol)
-                              for table in tables)
+        garblings = tuple(_garbling(table, target_joint, weights, atol,
+                                    support=support, source_order=order)
+                          for table, order in zip(tables, source_orders))
     return make_result(tables, posteriors, weights, 0.0, garblings,
                        return_channel=return_channel, prior=prior)

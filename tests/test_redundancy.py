@@ -7,10 +7,11 @@ from functools import partial
 from unittest.mock import patch
 
 import numpy as np
+from scipy import sparse
 from scipy.optimize import linprog
 
 from discrete_pid import redundancy_binary_sources, redundancy_binary_target
-from discrete_pid import _hull
+from discrete_pid import _hull, _martingale, binary_target
 
 
 def target_from_joints(joints, **kwargs):
@@ -84,8 +85,10 @@ class RedundancyTests(unittest.TestCase):
                                mutual_information(result.target_auxiliary_joint), places=11)
         if result.garblings is not None:
             for joint, kernel in zip(joints, result.garblings):
-                self.assertTrue(np.all(kernel >= 0))
-                np.testing.assert_allclose(kernel.sum(axis=1), 1, rtol=0, atol=1e-10)
+                entries = kernel.data if sparse.issparse(kernel) else kernel
+                self.assertTrue(np.all(entries >= 0))
+                np.testing.assert_allclose(np.asarray(kernel.sum(axis=1)).ravel(), 1,
+                                           rtol=0, atol=1e-10)
                 np.testing.assert_allclose(joint @ kernel, result.target_auxiliary_joint,
                                            rtol=0, atol=1e-9)
 
@@ -248,6 +251,153 @@ class RedundancyTests(unittest.TestCase):
         x = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
         for y in (1 - x, (1 - x) + np.array([0, 0, -1e-15, 0, 0])):
             np.testing.assert_array_equal(_hull._compiled_scan(x, y), _hull._scan(x, y))
+
+
+class SparseGarblingTests(unittest.TestCase):
+    def assert_kernel(self, joint, target_joint, kernel):
+        self.assertIsInstance(kernel, sparse.csr_matrix)
+        self.assertEqual(kernel.shape, (joint.shape[1], target_joint.shape[1]))
+        self.assertTrue(np.all(np.isfinite(kernel.data)))
+        self.assertTrue(np.all(kernel.data >= 0))
+        np.testing.assert_allclose(np.asarray(kernel.sum(axis=1)).ravel(), 1,
+                                   rtol=0, atol=2e-12)
+        np.testing.assert_allclose(joint @ kernel, target_joint, rtol=0, atol=2e-12)
+        # Each merged quantile cell and each deficit/excess match contributes
+        # only a constant number of entries, including zero-mass source rows.
+        self.assertLessEqual(kernel.nnz, 4 * sum(kernel.shape))
+
+    def reconstruct(self, joint, known_kernel):
+        target_joint = joint @ known_kernel
+        joint_before, target_before = joint.copy(), target_joint.copy()
+        actual = binary_target._garbling(joint, target_joint, target_joint.sum(axis=0), 1e-12)
+        self.assert_kernel(joint, target_joint, actual)
+        np.testing.assert_array_equal(joint, joint_before)
+        np.testing.assert_array_equal(target_joint, target_before)
+        return actual
+
+    def test_known_feasible_random_channels(self):
+        # Generate feasibility independently: every row-stochastic kernel is
+        # a valid garbling, without relying on the meet or coupling algorithm.
+        rng = np.random.default_rng(129)
+        for m, q in ((2, 3), (7, 2), (12, 17), (80, 110)):
+            for _ in range(4):
+                joint = rng.dirichlet(np.ones(2 * m)).reshape(2, m)
+                known = rng.dirichlet(np.ones(q), size=m)
+                with self.subTest(m=m, q=q):
+                    self.reconstruct(joint, known)
+
+    def test_duplicate_posteriors_permutations_and_zero_columns(self):
+        theta = np.array([.8, .2, .8, .2, .5, 0.])
+        mass = np.array([.1, .2, .15, .25, .3, 0.])
+        joint = np.vstack((1 - theta, theta)) * mass
+        # Identity preserves duplicated output posteriors but zero output
+        # states are omitted, matching the solver's output contract.
+        known = np.eye(6)[:, [4, 2, 0, 3, 1]]
+        known[-1, 0] = 1
+        actual = self.reconstruct(joint, known)
+        self.assertEqual(actual.getrow(5).nnz, 1)
+        self.assertEqual(actual[5].sum(), 1)
+
+    def test_tiny_source_masses_and_narrow_posterior_support(self):
+        for theta, mass in (
+                (np.array([0., .25, .5, 1.]), np.array([1e-14, .2, .3, .5 - 1e-14])),
+                (np.array([0., .25, .5, 1.]), np.array([1e-300, .2, .3, .5])),
+                (.5 + 1e-8 * np.array([-3., -1., 1., 3.]), np.full(4, .25)),
+                (.5 + 1e-14 * np.array([-.5, -1/6, 1/6, .5]), np.full(4, .25))):
+            joint = np.vstack((1 - theta, theta)) * mass
+            known = np.array([[.8, .2, 0.], [.3, .6, .1],
+                              [.1, .6, .3], [0., .2, .8]])
+            self.reconstruct(joint, known)
+
+    def test_public_solver_uses_sparse_garblings_without_linear_programming(self):
+        prior = np.array([.4, .6])
+        channels = [np.array([[.9, .1, 0], [.1, .9, 0]]),
+                    np.array([[.5, 0, .5], [0, .5, .5]])]
+        with patch('scipy.optimize.linprog', side_effect=AssertionError('LP called')):
+            result = redundancy_binary_target(prior, channels, return_channel=True,
+                                               return_garblings=True)
+        for channel, kernel in zip(channels, result.garblings):
+            self.assert_kernel(prior[:, None] * channel, result.target_auxiliary_joint, kernel)
+        self.assertLess(result.max_garbling_residual, 2e-12)
+
+    def test_public_solver_reuses_sorted_posterior_order(self):
+        prior = np.array([.37, .63])
+        channels = [np.array([[.08, .72, 0., .2], [.75, .15, 0., .1]]),
+                    np.array([[.65, .25, .1], [.1, .2, .7]])]
+        reconstruct = binary_target._garbling
+        seen = []
+
+        def checked(joint, *args, **kwargs):
+            order = kwargs.get('source_order')
+            self.assertIsNotNone(order)
+            mass = joint.sum(axis=0)
+            active = order[mass[order] > 0]
+            np.testing.assert_array_equal(np.sort(active), np.flatnonzero(mass > 0))
+            theta = joint[1, active] / mass[active]
+            self.assertTrue(np.all(np.diff(theta) >= 0))
+            seen.append(order.copy())
+            # Passing the order alone is insufficient: reconstruction must
+            # use it instead of performing another per-source sort.
+            with patch.object(binary_target.np, 'argsort',
+                              side_effect=AssertionError('posterior order recomputed')):
+                return reconstruct(joint, *args, **kwargs)
+
+        with patch.object(binary_target, '_garbling', side_effect=checked):
+            result = redundancy_binary_target(prior, channels, return_channel=True,
+                                               return_garblings=True)
+        self.assertEqual(len(seen), len(channels))
+        self.assertGreater(result.channel.shape[1], 1)
+        for channel, kernel in zip(channels, result.garblings):
+            self.assert_kernel(prior[:, None] * channel, result.target_auxiliary_joint, kernel)
+
+    def test_constant_meet_and_target_have_sparse_stochastic_kernels(self):
+        channels = [np.array([[.9, .1, 0], [.1, .9, 0]]),
+                    np.array([[.3, .7], [.3, .7]])]
+        for prior in (np.array([.4, .6]), np.array([1., 0.])):
+            result = redundancy_binary_target(prior, channels, return_channel=True,
+                                               return_garblings=True)
+            self.assertEqual(result.channel.shape[1], 1)
+            for channel, kernel in zip(channels, result.garblings):
+                self.assert_kernel(prior[:, None] * channel, result.target_auxiliary_joint, kernel)
+                self.assertEqual(kernel.nnz, channel.shape[1])
+
+    @unittest.skipIf(_martingale._compiled_couple is None, 'Numba is optional')
+    def test_martingale_is_compiled_at_import(self):
+        run = subprocess.run([sys.executable, '-c',
+                              'from discrete_pid import _martingale\n'
+                              'assert _martingale._compiled_couple.signatures\n'],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_martingale_fallback_preserves_extended_precision(self):
+        theta = np.array([0., .2, .8, 1.], dtype=np.longdouble)
+        mass = np.full(4, .25, dtype=np.longdouble)
+        support = np.array([.3, .7], dtype=np.longdouble)
+        weights = np.full(2, .5, dtype=np.longdouble)
+        expected = _martingale._couple(theta, mass, support, weights)
+        with patch.object(_martingale, '_compiled_couple', None):
+            actual = _martingale.inverse_transform(theta, mass, support, weights)
+        for computed, reference in zip(actual, expected):
+            np.testing.assert_array_equal(computed, reference)
+        if theta.dtype != np.dtype(np.float64):
+            with patch.object(_martingale, '_compiled_couple', side_effect=AssertionError('downcast')):
+                _martingale.inverse_transform(theta, mass, support, weights)
+
+    @unittest.skipIf(_martingale._compiled_couple is None, 'Numba is optional')
+    def test_compiled_martingale_matches_python(self):
+        rng = np.random.default_rng(614)
+        for m, q in ((2, 1), (5, 7), (40, 19)):
+            theta = np.sort(rng.random(m))
+            mass = rng.dirichlet(np.ones(m))
+            known = rng.dirichlet(np.ones(q), size=m)
+            weights = mass @ known
+            support = ((mass * theta) @ known) / weights
+            order = np.argsort(support)
+            support, weights = support[order], weights[order]
+            expected = _martingale._couple(theta, mass, support, weights)
+            actual = _martingale._compiled_couple(theta, mass, support, weights)
+            for computed, reference in zip(actual, expected):
+                np.testing.assert_array_equal(computed, reference)
 
 
 if __name__ == "__main__":

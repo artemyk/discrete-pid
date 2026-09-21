@@ -1,6 +1,7 @@
 """Independent full-coupling checks and returned upper-channel witnesses."""
 
 import itertools
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -205,6 +206,72 @@ class PricingTests(unittest.TestCase):
             self.assertLessEqual(expected, upper+1e-12)
             self.assertLessEqual(upper-expected, 2e-9)
             self.assertLessEqual(abs(scores.max()-expected), 2e-9)
+
+
+class MasterPrecisionTests(unittest.TestCase):
+    def setUp(self):
+        from discrete_pid import _union_sources_opt
+        self.module = _union_sources_opt
+        self.prior = np.array([.2, .3, .5])
+        self.a = np.array([[.1, .7, .4], [.8, .2, .6], [.5, .9, .3]])
+        self.patterns = cube_patterns(3)
+
+    def inaccurate_solver(self, settings_seen, *, always=False, damage_dual=False):
+        original = self.module.clarabel.DefaultSolver
+        def factory(*args):
+            settings = args[-1]
+            settings_seen.append(settings)
+            solver = original(*args)
+            damage = always or len(settings_seen) == 1
+            def solve():
+                result = solver.solve()
+                if not damage:
+                    return result
+                if damage_dual:
+                    damaged = np.asarray(result.z).copy()
+                    damaged[:len(self.prior)] += 1e-4
+                    return SimpleNamespace(status='AlmostSolved', x=result.x, z=damaged)
+                # An AlmostSolved result can have an accurate epigraph/dual
+                # objective but unacceptable probability-table residuals.
+                damaged = np.asarray(result.x).copy()
+                damaged[0] += 1e-4
+                return SimpleNamespace(status='AlmostSolved', x=damaged, z=result.z)
+            return SimpleNamespace(solve=solve)
+        return factory
+
+    def test_inaccurate_master_retries_with_tighter_different_scaling(self):
+        settings = []
+        with patch.object(self.module.clarabel, 'DefaultSolver',
+                          side_effect=self.inaccurate_solver(settings)):
+            value, alpha, B, dual, q, residual, retries = self.module.restricted_master(
+                self.prior, self.a, self.patterns, 1e-7)
+        self.assertEqual(retries, 1)
+        self.assertEqual(len(settings), 2)
+        self.assertLess(settings[1].tol_feas, settings[0].tol_feas)
+        self.assertFalse(settings[1].equilibrate_enable)
+        self.assertLessEqual(settings[0].reduced_tol_feas, 1e-9)
+        self.assertLess(residual, 1e-8)
+        np.testing.assert_allclose(q @ self.patterns, self.prior[:, None]*self.a, atol=1e-8)
+        price = pattern_scores(B, np.log(self.prior)+alpha, self.patterns, self.a).max()
+        self.assertLessEqual(value-(dual-max(0., price)), 5e-8)
+
+    def test_reconstructed_gap_rejects_inaccurate_dual(self):
+        settings = []
+        with patch.object(self.module.clarabel, 'DefaultSolver',
+                          side_effect=self.inaccurate_solver(settings, damage_dual=True)):
+            result = self.module.restricted_master(
+                self.prior, self.a, self.patterns, 1e-7)
+        self.assertEqual(result[-1], 1)
+        self.assertEqual(len(settings), 2)
+
+    def test_persistent_inaccuracy_raises_after_bounded_retries(self):
+        settings = []
+        with patch.object(self.module.clarabel, 'DefaultSolver',
+                          side_effect=self.inaccurate_solver(settings, always=True)):
+            with self.assertRaisesRegex(ArithmeticError, 'requested precision'):
+                self.module.restricted_master(self.prior, self.a, self.patterns, 1e-7)
+        self.assertEqual(len(settings), 3)
+        self.assertTrue(all(setting.reduced_tol_feas <= 1e-9 for setting in settings))
 
 
 if __name__ == '__main__':

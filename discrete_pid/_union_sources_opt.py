@@ -9,7 +9,7 @@ from scipy.spatial import ConvexHull, Delaunay, QhullError
 from scipy.special import xlogy
 
 from ._union_pricing import (compatible_states, global_pricing,
-                             improving_patterns)
+                             improving_patterns, pattern_scores)
 
 
 def initial_support(a):
@@ -106,33 +106,71 @@ def restricted_master(p, a, patterns, tolerance):
     rhs = np.r_[p, (p[:, None]*a).T.ravel(), np.zeros(3*n)]
     cones = ([clarabel.ZeroConeT(equality_count)]
              + [clarabel.ExponentialConeT() for _ in range(n)])
-    settings = clarabel.DefaultSettings()
-    settings.verbose = False
-    settings.max_threads = 1
-    settings.tol_gap_abs = settings.tol_gap_rel = settings.tol_feas = min(1e-9, tolerance/100)
-    settings.max_iter = 300
-    solver = clarabel.DefaultSolver(sp.csc_matrix((2*n, 2*n)),
-                                   np.r_[np.zeros(n), np.ones(n)], matrix, rhs, cones, settings)
-    result = solver.solve()
-    if str(result.status) not in ('Solved', 'AlmostSolved'):
-        raise ArithmeticError(f'Blackwell union master failed: {result.status}')
-    q = np.zeros((d, count))
-    q[ys, qs] = np.maximum(np.asarray(result.x[:n]), 0.)
-    totals = q.sum(axis=1)
-    if np.any(totals <= 0):
-        raise ArithmeticError('Master lost a positive-prior target row')
-    q *= (p/totals)[:, None]  # Make the returned conditional channel stochastic.
-    residual = max(np.max(np.abs(q.sum(axis=1)-p)),
-                   np.max(np.abs(q @ patterns-p[:, None]*a)))
-    if residual > max(1e-12, tolerance/10):
-        raise ArithmeticError(f'Blackwell union master feasibility residual is {residual:g}')
-    alpha = -np.asarray(result.z[:d])
-    B = -np.asarray(result.z[d:equality_count]).reshape(k, d).T
-    dual = float(p @ alpha+np.sum(p[:, None]*a*B))
-    value = float(np.sum(xlogy(q, q)-xlogy(q, p[:, None]*q.sum(axis=0))))
-    if not np.isfinite(value):
-        raise ArithmeticError('Master produced invalid mutual information')
-    return value, alpha, B, dual, q, float(residual)
+    feasibility_limit = max(1e-12, tolerance/10)
+    base_precision = min(1e-9, tolerance/100)
+    objective = np.r_[np.zeros(n), np.ones(n)]
+    quadratic = sp.csc_matrix((2*n, 2*n))
+    failures = []
+    for attempt in range(3):
+        settings = clarabel.DefaultSettings()
+        settings.verbose = False
+        settings.max_threads = 1
+        precision = (base_precision if attempt == 0
+                     else max(1e-13, min(1e-11, base_precision/100)))
+        settings.tol_gap_abs = settings.tol_gap_rel = settings.tol_feas = precision
+        # Clarabel otherwise accepts AlmostSolved with feasibility 1e-4.
+        # Its reduced termination must respect the requested numerical scale.
+        settings.reduced_tol_feas = min(1e-9, feasibility_limit/10)
+        settings.reduced_tol_gap_abs = settings.reduced_tol_gap_rel = tolerance/20
+        settings.max_iter = 300 if attempt == 0 else 500
+        if attempt == 1:
+            # Equilibration occasionally stalls on masters containing many
+            # nearly unused posterior columns. Re-solving the original scale
+            # with tighter tolerances repairs these cases without relaxing
+            # either the moment residual or the optimization-gap requirement.
+            settings.equilibrate_enable = False
+        elif attempt == 2:
+            settings.static_regularization_constant = 1e-10
+            settings.dynamic_regularization_delta = 1e-9
+            settings.iterative_refinement_abstol = 1e-14
+            settings.iterative_refinement_reltol = 1e-14
+            settings.iterative_refinement_max_iter = 30
+            settings.min_switch_step_length = 1e-4
+            settings.min_terminate_step_length = 1e-8
+            settings.max_step_fraction = .95
+        solver = clarabel.DefaultSolver(quadratic, objective, matrix, rhs, cones, settings)
+        result = solver.solve()
+        if str(result.status) not in ('Solved', 'AlmostSolved'):
+            failures.append(f'attempt {attempt+1}: {result.status}')
+            continue
+        q = np.zeros((d, count))
+        q[ys, qs] = np.maximum(np.asarray(result.x[:n]), 0.)
+        totals = q.sum(axis=1)
+        if np.any(totals <= 0) or not np.all(np.isfinite(q)):
+            failures.append(f'attempt {attempt+1}: invalid target row')
+            continue
+        q *= (p/totals)[:, None]  # Make the returned channel stochastic.
+        residual = max(np.max(np.abs(q.sum(axis=1)-p)),
+                       np.max(np.abs(q @ patterns-p[:, None]*a)))
+        if residual > feasibility_limit:
+            failures.append(f'attempt {attempt+1}: moment residual {residual:g}')
+            continue
+        alpha = -np.asarray(result.z[:d])
+        B = -np.asarray(result.z[d:equality_count]).reshape(k, d).T
+        dual = float(p @ alpha+np.sum(p[:, None]*a*B))
+        value = float(np.sum(xlogy(q, q)-xlogy(q, p[:, None]*q.sum(axis=0))))
+        # Recompute the objective and a feasible restricted dual: epigraph
+        # objectives can look converged even when the actual channel is not.
+        violation = float(pattern_scores(B, np.log(p)+alpha, patterns, a).max())
+        master_gap = value-(dual-max(0., violation))
+        roundoff = 64*np.finfo(float).eps*(1+abs(value)+abs(dual))
+        if (not np.isfinite(master_gap) or master_gap < -roundoff
+                or master_gap > tolerance/2):
+            failures.append(f'attempt {attempt+1}: reconstructed master gap {master_gap:g}')
+            continue
+        return value, alpha, B, dual, q, float(residual), attempt
+    raise ArithmeticError('Blackwell union master did not attain the requested precision; '
+                          + '; '.join(failures))
 
 
 def optimize(p, a, *, tolerance, batch_size, max_iterations, use_heuristic,
@@ -140,11 +178,13 @@ def optimize(p, a, *, tolerance, batch_size, max_iterations, use_heuristic,
     patterns = initial_support(a)
     boundary = bool(np.any((a == 0) | (a == 1)))
     global_calls = 0
+    master_retries = 0
     master_seconds = pricing_seconds = 0.
     best_lower = 0.
     for iteration in range(max_iterations):
         tick = time.perf_counter()
-        upper, alpha, B, dual, q, residual = restricted_master(p, a, patterns, tolerance)
+        upper, alpha, B, dual, q, residual, retries = restricted_master(p, a, patterns, tolerance)
+        master_retries += retries
         master_seconds += time.perf_counter()-tick
         tick = time.perf_counter()
         c = np.log(p)+alpha
@@ -178,6 +218,7 @@ def optimize(p, a, *, tolerance, batch_size, max_iterations, use_heuristic,
                     raw_gap_nats=upper-best_lower,
                     global_pricing_calls=global_calls, support=len(patterns),
                     solver_threads=1,
+                    master_retries=master_retries,
                     master_seconds=master_seconds, pricing_seconds=pricing_seconds)
         if len(enlarged) == len(patterns):
             raise ArithmeticError('Global pricing stalled above the requested numerical gap')

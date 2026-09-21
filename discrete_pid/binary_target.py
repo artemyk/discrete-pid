@@ -6,6 +6,9 @@ The hull takes O(N log N) operations and O(N) memory. Optional sparse source
 garblings use the inverse-transform martingale coupling of Jourdain and
 Margheriti (2020), https://arxiv.org/abs/1808.01390. Given sorted posterior
 laws, all couplings take O(N+k*q) additional operations and storage.
+
+Each bounded batch uses one global posterior order and separate source tail
+sums, retaining only its lower hull. uint32 counts bypass joint normalization.
 """
 
 from __future__ import annotations
@@ -20,14 +23,15 @@ from ._common import Array, RedundancyResult, make_result, normalize_prior
 from ._hull import lower_hull
 from ._validation import integer_weights, normalize_rows, validate_row_sums
 from ._martingale import inverse_transform, sparse_rows
+from ._target_scan import call_knots, count_posteriors, source_orders as recover_source_orders
 
 if TYPE_CHECKING:
     from scipy.sparse import csr_matrix
 
 
-# Bound the arrays used for normalization, sorting, and suffix sums. Only
+# Bound the arrays used for normalization, sorting, and call knots. Only
 # each batch's lower hull is retained for the final hull of their union.
-_BATCH_ENTRIES = 262144
+_BATCH_ENTRIES = 65536
 
 
 def _channel_batches(channels, prior):
@@ -36,7 +40,7 @@ def _channel_batches(channels, prior):
             raise ValueError("channels must have shape (number of sources, 2, source states)")
         step = max(1, _BATCH_ENTRIES // (2 * channels.shape[2]))
         for start in range(0, len(channels), step):
-            yield _normalize_channels(channels[start:start + step], prior)
+            yield _prepare_channels(channels[start:start + step], prior)
         return
     pending, entries, key = [], 0, None
     for channel in channels:
@@ -45,13 +49,22 @@ def _channel_batches(channels, prior):
             raise ValueError("each channel must have shape (2, source states)")
         current = (raw.shape, raw.dtype)
         if pending and (current != key or entries + raw.size > _BATCH_ENTRIES):
-            yield _normalize_channels(np.asarray(pending), prior)
+            yield _prepare_channels(np.asarray(pending), prior)
             pending, entries = [], 0
         pending.append(raw)
         entries += raw.size
         key = current
     if pending:
-        yield _normalize_channels(np.asarray(pending), prior)
+        yield _prepare_channels(np.asarray(pending), prior)
+
+
+def _prepare_channels(raw, prior):
+    # Full-support uint32 counts are validated during posterior calculation.
+    # A tiny positive p0 can coexist with p1 rounded to one: keep validation
+    # on the normalization path whenever the hull takes its degenerate branch.
+    if raw.dtype == np.uint32 and np.all(prior > 0) and 0. < prior[1] < 1.:
+        return raw
+    return _normalize_channels(raw, prior)
 
 
 def _normalize_channels(raw, prior):
@@ -63,9 +76,18 @@ def _normalize_channels(raw, prior):
     return weights
 
 
-def _envelope(locations, heights):
-    order = np.argsort(locations, kind="stable")
-    locations, heights = locations[order], heights[order]
+def _posterior_order(locations):
+    # Coarse integer keys accelerate the sort; refinement retains the full
+    # floating-point order, including ties, signed zero, and wider longdouble.
+    coarse = (locations * 65535).astype(np.uint16)
+    order = np.argsort(coarse, kind="stable")
+    return order[np.argsort(locations[order], kind="stable")]
+
+
+def _envelope(locations, heights, *, sorted=False):
+    if not sorted:
+        order = _posterior_order(locations)
+        locations, heights = locations[order], heights[order]
     starts = np.flatnonzero(np.concatenate(([True], locations[1:] != locations[:-1])))
     # Only the lowest knot at each location can belong to the lower hull.
     locations, heights = locations[starts], np.minimum.reduceat(heights, starts)
@@ -73,35 +95,39 @@ def _envelope(locations, heights):
     return locations[hull], heights[hull]
 
 
-def _posterior_meet(batches, p, atol, tables, source_orders=None):
+def _posterior_meet(batches, prior, atol, tables, source_orders=None):
     extended = np.longdouble
+    prior = np.asarray(prior, dtype=extended)
+    p = prior[1]
     pieces = []
     seen = False
     for batch in batches:
         seen = True
+        raw = batch.dtype == np.uint32
         if tables is not None:
-            tables.extend(np.asarray(batch, dtype=float))
+            joint = _normalize_channels(batch, prior) if raw else batch
+            tables.extend(np.asarray(joint, dtype=float))
         if p == 0.0 or p == 1.0:
             if source_orders is not None:
                 source_orders.extend([None] * len(batch))
             continue  # Still validate every input, even for a constant target.
-        weights = batch.sum(axis=1)
-        theta = np.zeros_like(weights)
-        np.divide(batch[:, 1], weights, out=theta, where=weights > 0)
-        order = np.argsort(theta, axis=1, kind="stable")
+        if raw:
+            theta, totals = count_posteriors(batch, prior)
+            multipliers = prior
+        else:
+            weights = batch.sum(axis=1)
+            theta = np.divide(batch[:, 1], weights, out=np.zeros_like(weights),
+                              where=weights > 0).ravel()
+            totals = np.ones(len(batch), dtype=np.uint64)
+            multipliers = np.ones(2, dtype=extended)
+        order = _posterior_order(theta)
         if source_orders is not None:
-            source_orders.extend(order)
-        theta = np.take_along_axis(theta, order, axis=1)
-        weights = np.take_along_axis(weights, order, axis=1)
-        tail_mass = np.cumsum(weights[:, ::-1], axis=1, dtype=extended)[:, ::-1]
-        tail_moment = np.cumsum((weights * theta)[:, ::-1], axis=1, dtype=extended)[:, ::-1]
-        calls = np.maximum(tail_moment - theta * tail_mass, 0)
-        interior = (theta > 0) & (theta < 1) & (weights > 0)
-        locations = np.concatenate(([extended(0), extended(1)], theta[interior]))
-        heights = np.concatenate(([extended(p), extended(0)], calls[interior]))
+            source_orders.extend(recover_source_orders(order, len(batch), batch.shape[2]))
+        locations, heights = call_knots(batch, theta, order, totals, multipliers)
+        heights[0] = p
         # A point above a batch's lower hull cannot affect the global lower
         # hull. This reduction is optional mathematically, and saves memory.
-        pieces.append(_envelope(locations, heights))
+        pieces.append(_envelope(locations, heights, sorted=True))
     if not seen:
         raise ValueError("at least one source channel is required")
     if p == 0.0 or p == 1.0:
@@ -216,8 +242,10 @@ def redundancy_binary_target(
     arithmetic, with extended precision where available. ``atol`` controls
     numerical consistency checks (default 1e-12), not collinearity or an
     error bound on redundancy. Very small posterior atoms may be lost to
-    roundoff. Bounded batches avoid full-size temporary matrices; their
-    lower hulls are combined in O(N log N) time and O(N) worst-case memory.
+    roundoff. Each batch uses one global posterior order and a scan with
+    separate source tail sums. uint32 counts avoid normalized joint arrays
+    unless garblings are requested. Bounded batches retain only their
+    lower hulls, combined in O(N log N) time and O(N) worst-case memory.
 
     Set return_channel=True to return P(Q|Y) in result.channel, together with
     posteriors and posterior weights. Independently, return_garblings=True
@@ -238,7 +266,7 @@ def redundancy_binary_target(
     tables = [] if return_garblings else None
     source_orders = [] if return_garblings else None
     support, weights = _posterior_meet(_channel_batches(channels, prior),
-                                       float(prior[1]), atol, tables, source_orders)
+                                       prior, atol, tables, source_orders)
     posteriors = np.vstack((1 - support, support))
     garblings = None
     if return_garblings:

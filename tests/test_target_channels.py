@@ -104,7 +104,7 @@ class TargetChannelTests(unittest.TestCase):
         self.assertLess(errors[2], 1e-6)
 
     def test_normalization_batches_are_bounded(self):
-        channels = np.tile(np.array([[[9, 1], [1, 9]]], dtype=np.uint32), (101, 1, 1))
+        channels = np.tile(np.array([[[9., 1], [1, 9]]]), (101, 1, 1))
         normalize = binary_target._normalize_channels
         seen = []
 

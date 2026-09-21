@@ -133,9 +133,12 @@ and weights are normalized by definition.
 
 ## Algorithms and numerical behavior
 
-**Binary target.** Sort the source posterior probabilities `P(Y=1 | X_i)`,
-construct the lower convex hull of their call-function knots, and recover the
-meet's posterior law from slope jumps. This implements the classical binary
+**Binary target.** Sort all posterior probabilities `P(Y=1 | X_i)` in a batch
+together, then scan once with separate tail sums for each source. This produces
+the call-function knots in order, ready for their lower convex hull. Retain each
+batch hull, take the hull of their union, and recover the meet's posterior law
+from slope jumps. uint32 inputs use the counts directly, with uint64 row-sum
+validation and floating-point posterior/call calculations. This implements the classical binary
 Blackwell meet of Bertschinger and Rauh (2014), Section 4. Optional sparse
 garblings use the inverse-transform martingale coupling of Jourdain and
 Margheriti (2020), without linear programming. A meet can have more than two
@@ -145,9 +148,10 @@ Binary-target redundancy is continuous (Kolchinsky, 2022, Section 5.5 and
 Appendix D), so exact arithmetic and a collinearity tolerance are unnecessary.
 The hull uses `np.longdouble` and discards slope jumps at roundoff scale;
 extremely small atoms may be lost. `atol` controls numerical consistency
-checks, not a bound on redundancy error. Bounded batches retain only their
-lower hulls for the final hull, avoiding large temporary matrices. Normalized
-joint tables are retained only when garblings are requested.
+checks, not a bound on redundancy error. Sorting uses uint16 coarse keys followed
+by refinement with the original coordinates. Bounded batches avoid large
+temporary matrices; uint32 inputs need normalized joint tables only when
+garblings are requested.
 
 **Binary sources.** Intersect the posterior segments through the prior. An
 uninformative source or segments on distinct lines give zero redundancy;
@@ -167,8 +171,8 @@ in redundancy; `tolerance=0` still uses floating-point arithmetic.
 compilation from solver calls. Without it, the same bare Python loops run and
 one warning recommends `discrete-pid[speed]`. Integer row-sum validation stops
 at the first mismatch without full source-by-target temporary arrays. On
-platforms where `longdouble` is wider than `float64`, the hull and martingale
-coupling retain Python scans to preserve precision; Numba accelerates those
+platforms where `longdouble` is wider than `float64`, the binary-target posterior,
+call, hull and martingale scans run in Python to preserve precision; Numba accelerates those
 scans when the precisions agree, including Apple Silicon.
 
 ## Tests

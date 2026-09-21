@@ -19,6 +19,7 @@ jobs:
       - run: python -m pip install ".[test]"
       - run: python -m unittest discover -s tests -v
       - run: python examples/quickstart.py
+      - run: python examples/union.py
 
   numba:
     runs-on: ubuntu-latest
@@ -30,3 +31,4 @@ jobs:
       - run: python -m pip install ".[test,speed]"
       - run: python -m unittest discover -s tests -v
       - run: python examples/quickstart.py
+      - run: python examples/union.py

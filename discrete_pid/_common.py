@@ -52,6 +52,51 @@ class RedundancyResult:
         return self.posteriors * self.posterior_weights
 
 
+@dataclass(frozen=True)
+class UnionResult:
+    """Union information and optional common-upper-channel outputs.
+
+    ``channel[y,q]`` is P(Q=q | Y=y), with posterior columns P(Y | Q=q).
+    Unlike redundancy garblings, ``garblings[i]`` decodes P(X_i | Q),
+    with shape (number of Q states, number of source states). Residuals
+    compare P(Y,Q) @ garblings[i] with the input P(Y,X_i).
+
+    Optimization bounds and gaps are floating-point estimates, not interval
+    certificates. For the binary-target geometric construction they coincide
+    with the returned information, up to floating-point arithmetic.
+    """
+
+    union_nats: float
+    target_prior: Array
+    lower_bound_nats: float | None = None
+    upper_bound_nats: float | None = None
+    gap_nats: float = 0.0
+    feasibility_residual: float | None = None
+    iterations: int = 0
+    method: str = ""
+    diagnostics: dict | None = None
+    posteriors: Array | None = None
+    posterior_weights: Array | None = None
+    garblings: tuple[Array | csr_matrix, ...] | None = None
+    max_garbling_residual: float | None = None
+    channel: Array | None = None
+
+    @property
+    def union_bits(self) -> float:
+        return self.union_nats / np.log(2.0)
+
+    @property
+    def optimization_gap_nats(self) -> float:
+        return self.gap_nats
+
+    @property
+    def target_auxiliary_joint(self) -> Array | None:
+        """P(Y,Q), or None unless return_channel=True."""
+        if self.posteriors is None:
+            return None
+        return self.posteriors * self.posterior_weights
+
+
 def normalize_prior(prior):
     raw = np.asarray(prior)
     if raw.ndim != 1 or raw.size == 0 or raw.dtype.kind not in 'iufO':

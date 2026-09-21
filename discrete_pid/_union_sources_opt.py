@@ -1,10 +1,12 @@
 """Convex masters and verified source reduction for binary-source union."""
 
 import time
+import warnings
 
 import clarabel
 import numpy as np
 import scipy.sparse as sp
+from scipy.optimize import OptimizeWarning, linprog
 from scipy.spatial import ConvexHull, Delaunay, QhullError
 from scipy.special import xlogy
 
@@ -173,17 +175,84 @@ def restricted_master(p, a, patterns, tolerance):
                           + '; '.join(failures))
 
 
+def compress_support(p, a, q, patterns, tolerance):
+    """Reweight fixed posteriors by an LP, retaining a feasible smaller support.
+
+    Information is linear in these weights. A basic LP optimum needs at most
+    d*(k+1) atoms. Numerical candidates are checked against the original
+    moments and recomputed information; an inconclusive LP keeps all atoms.
+    """
+    unchanged = (q, patterns, False)
+    weights = q.sum(axis=0)
+    ids = np.flatnonzero(weights > 0)
+    posterior = q[:, ids]/weights[ids]
+    features = np.column_stack((np.ones(len(ids)), patterns[ids]))
+    moments = (posterior[:, :, None]*features[None, :, :]).transpose(0, 2, 1)
+    moments = moments.reshape(-1, len(ids))
+    cost = np.sum(xlogy(posterior, posterior)-posterior*np.log(p[:, None]), axis=0)
+    precision = min(1e-9, max(1e-10, tolerance/100))
+    try:
+        # Disable parallel HiGHS work without changing its process-wide thread
+        # pool, which may already have been initialized by another caller.
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=OptimizeWarning,
+                                    message='Unrecognized options detected: .*parallel.*')
+            answer = linprog(cost, A_eq=moments, b_eq=moments @ weights[ids],
+                             bounds=(0, None), method='highs-ds',
+                             options={'primal_feasibility_tolerance': precision,
+                                      'dual_feasibility_tolerance': precision,
+                                      'parallel': False})
+    except (ValueError, RuntimeError):
+        return unchanged
+    if not answer.success or not np.all(np.isfinite(answer.x)):
+        return unchanged
+    new_weights = np.maximum(answer.x, 0.)
+    keep = new_weights > 0
+    if not np.any(keep) or np.count_nonzero(keep) >= len(patterns):
+        return unchanged
+    reduced = posterior[:, keep]*new_weights[keep]
+    selected = patterns[ids[keep]]
+    residual = max(np.max(np.abs(reduced.sum(axis=1)-p)),
+                   np.max(np.abs(reduced @ selected-p[:, None]*a)))
+    before = float(np.sum(xlogy(q, q)-xlogy(q, p[:, None]*weights)))
+    after = float(np.sum(xlogy(reduced, reduced)
+                         -xlogy(reduced, p[:, None]*reduced.sum(axis=0))))
+    if (not np.isfinite(residual) or not np.isfinite(after)
+            or residual > max(1e-12, tolerance/10) or after > before+tolerance/10):
+        return unchanged
+    return reduced, selected, True
+
+
 def optimize(p, a, *, tolerance, batch_size, max_iterations, use_heuristic,
              max_pricing_nodes):
     patterns = initial_support(a)
+    archive = patterns.copy()
+    seen_supports = {patterns.tobytes()}
+    compression_enabled = True
+    compression_limit = 1.5*a.shape[0]*(a.shape[1]+1)
+    compressions = compression_fallbacks = 0
+    largest_support = len(patterns)
     boundary = bool(np.any((a == 0) | (a == 1)))
     global_calls = 0
     master_retries = 0
-    master_seconds = pricing_seconds = 0.
+    master_seconds = pricing_seconds = compression_seconds = 0.
     best_lower = 0.
     for iteration in range(max_iterations):
         tick = time.perf_counter()
-        upper, alpha, B, dual, q, residual, retries = restricted_master(p, a, patterns, tolerance)
+        try:
+            master = restricted_master(p, a, patterns, tolerance)
+        except ArithmeticError:
+            if not compression_enabled or len(archive) == len(patterns):
+                raise
+            # An LP preserves moments only to numerical precision. If its
+            # support is too fragile for the conic solver, restore every
+            # generated pattern and resume ordinary column generation.
+            patterns = archive.copy()
+            compression_enabled = False
+            compression_fallbacks += 1
+            largest_support = max(largest_support, len(patterns))
+            master = restricted_master(p, a, patterns, tolerance)
+        upper, alpha, B, dual, q, residual, retries = master
         master_retries += retries
         master_seconds += time.perf_counter()-tick
         tick = time.perf_counter()
@@ -204,7 +273,8 @@ def optimize(p, a, *, tolerance, batch_size, max_iterations, use_heuristic,
                 B, c, a, limit=batch_size, tolerance=tolerance/20, max_nodes=max_pricing_nodes)
             global_calls += 1
             global_call = True
-            enlarged = np.unique(np.vstack((patterns, candidates[values > tolerance/10])), axis=0)
+            additions = candidates[values > tolerance/10]
+            enlarged = np.unique(np.vstack((patterns, additions)), axis=0)
         pricing_seconds += time.perf_counter()-tick
         if global_call:
             best_lower = max(best_lower, dual-max(0., price_bound))
@@ -219,8 +289,38 @@ def optimize(p, a, *, tolerance, batch_size, max_iterations, use_heuristic,
                     global_pricing_calls=global_calls, support=len(patterns),
                     solver_threads=1,
                     master_retries=master_retries,
-                    master_seconds=master_seconds, pricing_seconds=pricing_seconds)
+                    master_seconds=master_seconds, pricing_seconds=pricing_seconds,
+                    compression_seconds=compression_seconds, compressions=compressions,
+                    compression_fallbacks=compression_fallbacks,
+                    largest_support=largest_support)
+        archive = np.unique(np.vstack((archive, additions)), axis=0)
         if len(enlarged) == len(patterns):
-            raise ArithmeticError('Global pricing stalled above the requested numerical gap')
+            if not compression_enabled or len(archive) == len(patterns):
+                raise ArithmeticError('Global pricing stalled above the requested numerical gap')
+            compression_enabled = False
+            compression_fallbacks += 1
+            enlarged = archive.copy()
+        if compression_enabled and compressions >= max(1, max_iterations//4):
+            # Bound the number of compressions, then use an expanding support
+            # even if pruning keeps revisiting different combinations of atoms.
+            compression_enabled = False
+            if len(archive) > len(enlarged):
+                compression_fallbacks += 1
+            enlarged = archive.copy()
+        elif compression_enabled and len(enlarged) > compression_limit:
+            tick = time.perf_counter()
+            _, retained, accepted = compress_support(p, a, q, patterns, tolerance)
+            compression_seconds += time.perf_counter()-tick
+            if accepted:
+                proposed = np.unique(np.vstack((retained, additions)), axis=0)
+                if proposed.tobytes() in seen_supports:
+                    compression_enabled = False
+                    compression_fallbacks += 1
+                    enlarged = archive.copy()
+                else:
+                    enlarged = proposed
+                    compressions += 1
         patterns = enlarged
+        seen_supports.add(patterns.tobytes())
+        largest_support = max(largest_support, len(patterns))
     raise RuntimeError(f'Blackwell union exceeded max_iterations={max_iterations}')

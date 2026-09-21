@@ -112,6 +112,47 @@ class UnionSourcesTests(unittest.TestCase):
         self.assertLessEqual(result.diagnostics['source_reduction_residual'], 1e-12)
         self.assert_witness(p, data, result)
 
+    @unittest.skipIf(cp is None, 'CVXPY is an independent test-only oracle')
+    def test_compressed_exchange_matches_full_coupling(self):
+        rng = np.random.default_rng(27)
+        p = rng.dirichlet(np.ones(3))
+        a = rng.uniform(.03, .97, (3, 6)).T
+        result = union_binary_sources(p, channels(a), reduce_sources=False,
+                                       return_channel=True, return_garblings=True)
+        self.assertGreater(result.diagnostics['compressions'], 0)
+        reference = full_coupling(p, a)
+        self.assertLessEqual(result.lower_bound_nats-1e-7, reference)
+        self.assertLessEqual(reference, result.upper_bound_nats+1e-7)
+        self.assert_witness(p, channels(a), result)
+
+    def test_compressed_master_failure_restores_generated_patterns(self):
+        from discrete_pid import _union_sources_opt as module
+        rng = np.random.default_rng(27)
+        p = rng.dirichlet(np.ones(3))
+        a = rng.uniform(.03, .97, (3, 6)).T
+        compress = module.compress_support
+        master = module.restricted_master
+        state = dict(compressed=False, damaged=False)
+
+        def track_compression(*args, **kwargs):
+            result = compress(*args, **kwargs)
+            state['compressed'] |= result[2]
+            return result
+
+        def fail_once_after_compression(*args, **kwargs):
+            if state['compressed'] and not state['damaged']:
+                state['damaged'] = True
+                raise ArithmeticError('test: compressed support is numerically infeasible')
+            return master(*args, **kwargs)
+
+        with patch.object(module, 'compress_support', side_effect=track_compression), \
+                patch.object(module, 'restricted_master', side_effect=fail_once_after_compression):
+            result = union_binary_sources(p, channels(a), reduce_sources=False,
+                                           return_channel=True, return_garblings=True)
+        self.assertTrue(state['damaged'])
+        self.assertGreater(result.diagnostics['compression_fallbacks'], 0)
+        self.assert_witness(p, channels(a), result)
+
     def test_zero_prior_rows_target_dispatch_and_output_flags(self):
         data = np.array([[[0, 0], [1, 4], [4, 1]],
                          [[0, 0], [2, 3], [5, 0]]], dtype=np.uint32)
@@ -206,6 +247,55 @@ class PricingTests(unittest.TestCase):
             self.assertLessEqual(expected, upper+1e-12)
             self.assertLessEqual(upper-expected, 2e-9)
             self.assertLessEqual(abs(scores.max()-expected), 2e-9)
+
+
+class SupportCompressionTests(unittest.TestCase):
+    def fixture(self, *, boundary=False):
+        p = np.array([.2, .3, .5])
+        patterns = cube_patterns(5)
+        q = np.random.default_rng(394).uniform(.01, 1., (len(p), len(patterns)))
+        if boundary:
+            q[0, patterns[:, 0] == 1] = 0
+            q[1, patterns[:, 0] == 0] = 0
+            q[2, patterns[:, 1] == 0] = 0
+        q[:, 0] = 0  # A zero-mass column must not require a posterior.
+        q *= (p/q.sum(axis=1))[:, None]
+        a = (q @ patterns)/p[:, None]
+        return p, a, q, patterns
+
+    def test_compression_preserves_moments_and_does_not_increase_information(self):
+        from discrete_pid._union_sources_opt import compress_support
+        for boundary in (False, True):
+            with self.subTest(boundary=boundary):
+                p, a, q, patterns = self.fixture(boundary=boundary)
+                before_q, before_patterns = q.copy(), patterns.copy()
+                compressed, kept, accepted = compress_support(p, a, q, patterns, 1e-7)
+                self.assertTrue(accepted)
+                self.assertLess(len(kept), len(patterns))
+                self.assertLessEqual(len(kept), len(p)*(a.shape[1]+1))
+                self.assertTrue(np.all(np.isfinite(compressed)))
+                self.assertTrue(np.all(compressed >= 0))
+                self.assertTrue(np.all(compressed.sum(axis=0) > 0))
+                np.testing.assert_allclose(compressed.sum(axis=1), p, rtol=0, atol=1e-8)
+                np.testing.assert_allclose(compressed @ kept, p[:, None]*a, rtol=0, atol=1e-8)
+                self.assertLessEqual(information(p, compressed), information(p, q)+1e-10)
+                np.testing.assert_array_equal(q, before_q)
+                np.testing.assert_array_equal(patterns, before_patterns)
+
+    def test_failed_nonfinite_or_infeasible_lp_keeps_original_support(self):
+        from discrete_pid import _union_sources_opt as module
+        p, a, q, patterns = self.fixture()
+        positive = np.count_nonzero(q.sum(axis=0) > 0)
+        answers = [SimpleNamespace(success=False)]
+        answers.extend(SimpleNamespace(success=True, x=np.full(positive, value))
+                       for value in (np.nan, np.inf, 0.))
+        for answer in answers:
+            with self.subTest(answer=answer), patch.object(module, 'linprog', return_value=answer):
+                returned_q, returned_patterns, accepted = module.compress_support(
+                    p, a, q, patterns, 1e-7)
+                self.assertFalse(accepted)
+                np.testing.assert_array_equal(returned_q, q)
+                np.testing.assert_array_equal(returned_patterns, patterns)
 
 
 class MasterPrecisionTests(unittest.TestCase):

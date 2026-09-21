@@ -105,6 +105,13 @@ relative-entropy problem with Clarabel, and adds binary decoder patterns using
 a global pricing oracle. It does not discretize target posteriors. Binary
 targets and at most two retained sources use specialized routines.
 
+When the active pattern set grows, a linear program reweights its fixed
+posteriors to retain a smaller feasible support before the next conic solve.
+Compression checks the original moments and information value; subsequent
+masters reoptimize the posteriors. Numerical failure or repeated supports
+restore all generated patterns and disable compression. Global pricing and
+the requested stopping accuracy are unchanged.
+
 For up to three active target states, global pricing uses the binary-pattern
 geometry (or enumeration for small retained source sets). Larger targets use
 a branch-and-bound search with an explicit work limit. Reaching that limit

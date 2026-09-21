@@ -47,7 +47,9 @@ def union_binary_sources(
 
     Binary targets use a direct envelope; two retained sources use a scalar
     search. Other inputs use an adaptive relative-entropy program with global
-    pricing before termination. No posterior grid is used. The reported
+    pricing before termination. An LP periodically compresses the active
+    support while checking moments and information; inconclusive compression
+    retains the original patterns. No posterior grid is used. The reported
     ``tolerance`` must be at least 1e-10. ``gap_nats`` is a floating-point
     primal/global-dual diagnostic, not an
     interval-arithmetic certificate. ``feasibility_residual`` measures the
